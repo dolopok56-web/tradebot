@@ -1,0 +1,14 @@
+{
+  "BTC": {
+    "tp_mul": 1.9101744000000003,
+    "sl_mul": 1.1820898499999999,
+    "risk": 1.12,
+    "win": 3,
+    "loss": 0,
+    "streak_win": 3,
+    "streak_loss": 0,
+    "last_sig": "BTC|BUY|UP|121.2|1m",
+    "last_sig_ts": 1760287514.9257805,
+    "last_outcome": "TP"
+  }
+}

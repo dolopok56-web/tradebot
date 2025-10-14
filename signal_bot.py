@@ -26,7 +26,7 @@ USE_5M_CONFIRM = True
 STRUCT_BARS    = 1
 
 # Минимальные буферы (порог шума)
-MIN_SPREAD = {"BTC": 277.5, "NG": 0.006, "XAU": 0.25}
+MIN_SPREAD = {"BTC": 277.5, "NG": 0.004, "XAU": 0.25}
 
 # Динамика буфера
 ATR_K   = {"BTC": 7.0, "NG": 0.40, "XAU": 0.55}
@@ -197,104 +197,191 @@ async def _http_get_json(session: aiohttp.ClientSession, url: str) -> dict:
         await asyncio.sleep(HTTP_RETRY_SLEEP)
     return {}
 
+# ===================== PRICE (robust NG/XAU) =====================
+
+# --- новые настройки для фетчей ---
+ROBUST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/119.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+YAHOO_TIMEOUT_S = 12
+YAHOO_RETRIES   = 4           # максимум попыток на один запрос
+YAHOO_BACKOFF0  = 0.9         # стартовый бэкофф (сек)
+YAHOO_JITTER    = 0.35        # случайная примесь
+
+# Кэш, чтобы не ддосить источники и не ловить 429
+# хранит: {symbol: {"ts": last_fetch_time, "df": DataFrame, "feed":"yahoo/stooq"}}
+_prices_cache = {}
+
+def _now():
+    return time.time()
+
+async def _http_get_text(session: aiohttp.ClientSession, url: str) -> str:
+    # (оставь как было) — нужен для stooq
+    for i in range(HTTP_RETRIES):
+        try:
+            async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
+                if r.status == 200:
+                    return await r.text()
+                await asyncio.sleep(0.25)
+        except Exception as e:
+            logging.warning(f"GET text fail [{i+1}/{HTTP_RETRIES}] {url}: {e}")
+        await asyncio.sleep(HTTP_RETRY_SLEEP)
+    return ""
+
+async def _http_get_json_robust(session: aiohttp.ClientSession, url: str) -> dict:
+    """Yahoo v8 с нормальными заголовками, бэкоффом и ретраями."""
+    backoff = YAHOO_BACKOFF0
+    for i in range(YAHOO_RETRIES):
+        try:
+            async with session.get(url, timeout=YAHOO_TIMEOUT_S, headers=ROBUST_HEADERS) as r:
+                if r.status == 200:
+                    return await r.json(content_type=None)
+                # 429/503 — подождём и повторим
+                if r.status in (429, 503):
+                    logging.warning(f"YAHOO {r.status} on GET json: {url}")
+                    await asyncio.sleep(backoff + (random.random() * YAHOO_JITTER))
+                    backoff *= 1.7
+                    continue
+                # прочие статусы — бессмысленно ретраить
+                logging.warning(f"YAHOO status {r.status}: {url}")
+                return {}
+        except Exception as e:
+            logging.warning(f"YAHOO GET json fail [{i+1}/{YAHOO_RETRIES}] {url}: {e}")
+        await asyncio.sleep(backoff + (random.random() * YAHOO_JITTER))
+        backoff *= 1.6
+    return {}
+
+def _df_from_yahoo_v8(payload: dict) -> pd.DataFrame:
+    """Парсит ответ chart/v8: берём timestamps + indicators.quote[*]."""
+    try:
+        r = payload.get("chart", {}).get("result", [])[0]
+        ts = r.get("timestamp", [])
+        q  = r.get("indicators", {}).get("quote", [])[0]
+        if not ts or not q: 
+            return pd.DataFrame()
+        df = pd.DataFrame({
+            "Open":  q.get("open",  []),
+            "High":  q.get("high",  []),
+            "Low":   q.get("low",   []),
+            "Close": q.get("close", []),
+        }, index=pd.to_datetime(ts, unit="s"))
+        # убираем «дыры» — ffill/bfill, затем дроп нулей, хвост 300
+        df = df.replace([None, np.nan], method="ffill").replace([None, np.nan], method="bfill")
+        df = df.dropna().tail(300).reset_index(drop=True)
+        # фильтр нулевых/абсурдных
+        for col in ("Open","High","Low","Close"):
+            df = df[df[col] > 0]
+        return df.tail(300).reset_index(drop=True)
+    except Exception as e:
+        logging.warning(f"Yahoo v8 parse error: {e}")
+        return pd.DataFrame()
+
 def df_from_stooq_csv(text: str):
+    """Оставь как было, но чуть надёжнее на пустых ответах."""
     try:
         from io import StringIO
+        if not text or "Date,Open,High,Low,Close" not in text:
+            return pd.DataFrame()
         df = pd.read_csv(StringIO(text))
-        if not {"Open","High","Low","Close"}.issubset(df.columns): return pd.DataFrame()
+        if not {"Open","High","Low","Close"}.issubset(df.columns):
+            return pd.DataFrame()
         return df.tail(300).reset_index(drop=True)
-    except:
+    except Exception:
         return pd.DataFrame()
 
-async def _get_df_yahoo(session: aiohttp.ClientSession, ticker: str) -> pd.DataFrame:
-    base = random.choice(YA_URLS)
-    url = f"{base}/v8/finance/chart/{ticker}?interval=1m&range=1d"
-    data = await _http_get_json(session, url)
-    try:
-        res  = data.get("chart", {}).get("result", [])
-        if not res: return pd.DataFrame()
-        r0   = res[0]
-        ts   = r0.get("timestamp", [])
-        ind  = r0.get("indicators", {})
-        q    = ind.get("quote", [])
-        if not ts or not q: return pd.DataFrame()
-        q0 = q[0]
-        o = pd.Series(q0.get("open",  []), dtype="float64")
-        h = pd.Series(q0.get("high",  []), dtype="float64")
-        l = pd.Series(q0.get("low",   []), dtype="float64")
-        c = pd.Series(q0.get("close", []), dtype="float64")
+async def _get_df_ng_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
+    # NG=F, 1m/1d — как у тебя, но с robust get + парсером
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/NG%3DF?interval=1m&range=1d"
+    data = await _http_get_json_robust(session, url)
+    return _df_from_yahoo_v8(data)
 
-        # починка пропусков (как раньше)
-        for s in (o,h,l,c):
-            s.replace([None, np.nan], method="ffill", inplace=True)
-            s.replace([None, np.nan], method="bfill", inplace=True)
+async def _get_df_xau_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d"
+    data = await _http_get_json_robust(session, url)
+    return _df_from_yahoo_v8(data)
 
-        df = pd.DataFrame({"Open":o, "High":h, "Low":l, "Close":c})
-        df = df.replace([None, np.nan], method="ffill").replace([None, np.nan], method="bfill")
-        df = df.tail(300).reset_index(drop=True)
-        return df
-    except Exception as e:
-        logging.warning(f"Yahoo parse exception {ticker}: {e}")
-        return pd.DataFrame()
+async def _get_df_ng_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
+    txt = await _http_get_text(session, "https://stooq.com/q/d/l/?s=ng.f&i=1")
+    return df_from_stooq_csv(txt)
+
+async def _get_df_xau_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
+    txt = await _http_get_text(session, "https://stooq.com/q/d/l/?s=xauusd&i=1")
+    return df_from_stooq_csv(txt)
 
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
+    """
+    ЕДИНСТВЕННОЕ место, которое дергает движок.
+    Тут добавлен кэш (10–15 c для NG/XAU), robust Yahoo и stooq-фолбэк.
+    BTC оставляю как было (CryptoCompare), но тоже подхватываю headers/hb.
+    """
+    global last_candle_close_ts, _prices_cache
+
+    # кэширование для NG/XAU (чтобы не ловить 429)
+    cache_ttl = 12.0 if symbol in ("NG", "XAU") else 2.0
+    c = _prices_cache.get(symbol)
+    now_ts = _now()
+    if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
+        return c["df"]
+
     if symbol == "BTC":
-        data = await _http_get_json(session, CC_URL)
+        data = await _http_get_json_robust(session, CC_URL)  # можно оставить твой _http_get_json; я просто унифицировал
         try:
-            if data.get("Response") != "Success": return pd.DataFrame()
+            if data.get("Response") != "Success":
+                return pd.DataFrame()
             arr = data["Data"]["Data"]
             df = pd.DataFrame(arr)
             if "time" in df.columns:
                 last_ts = int(df["time"].iloc[-1])
                 last_candle_close_ts["BTC"] = last_ts
             df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"}, inplace=True)
-            return df[["Open","High","Low","Close"]].tail(300).reset_index(drop=True)
+            df = df[["Open","High","Low","Close"]].tail(300).reset_index(drop=True)
+            _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"cc"}
+            return df
         except Exception as e:
             logging.warning(f"BTC df parse error: {e}")
             return pd.DataFrame()
 
-    elif symbol == "NG":
-        now = time.time()
-
-        # если в бэкоффе, сперва stooq
-        if now < YAHOO_BACKOFF_UNTIL["NG"]:
-            txt = await _http_get_text(session, STOOQ_TPL.format(ticker="ng.f"))
-            df = df_from_stooq_csv(txt)
-            if not df.empty:
-                last_candle_close_ts["NG"] = int(now)
-                return df
-
-        # 1) Yahoo как основной
-        df = await _get_df_yahoo(session, "NG=F")
+    if symbol == "NG":
+        # 1) пытаемся Yahoo
+        df = await _get_df_ng_yahoo(session)
         if not df.empty:
-            last_candle_close_ts["NG"] = int(now)
+            last_candle_close_ts["NG"] = time.time()  # статус «живёт»
+            _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
             return df
-        else:
-            # ставим бэкофф на 10 минут
-            YAHOO_BACKOFF_UNTIL["NG"] = now + 10*60
-
-        # 2) Stooq fallback
-        txt = await _http_get_text(session, STOOQ_TPL.format(ticker="ng.f"))
-        df = df_from_stooq_csv(txt)
+        # 2) фолбэк stooq
+        df = await _get_df_ng_stooq(session)
         if not df.empty:
-            last_candle_close_ts["NG"] = int(now)
+            last_candle_close_ts["NG"] = time.time()
+            _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"stooq"}
             return df
+        # 3) последний удачный кэш — лучше, чем пустота
+        if c and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
+            return c["df"]
         return pd.DataFrame()
 
-    elif symbol == "XAU":
-        # сначала Yahoo
-        df = await _get_df_yahoo(session, "XAUUSD=X")
+    if symbol == "XAU":
+        df = await _get_df_xau_yahoo(session)
         if not df.empty:
-            last_candle_close_ts["XAU"] = int(time.time())
+            last_candle_close_ts["XAU"] = time.time()
+            _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
             return df
-        # fallback stooq
-        txt = await _http_get_text(session, STOOQ_TPL.format(ticker="xauusd"))
-        df = df_from_stooq_csv(txt)
+        df = await _get_df_xau_stooq(session)
         if not df.empty:
-            last_candle_close_ts["XAU"] = int(time.time())
+            last_candle_close_ts["XAU"] = time.time()
+            _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed":"stooq"}
             return df
+        if c and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
+            return c["df"]
         return pd.DataFrame()
 
+    # неизвестный символ
     return pd.DataFrame()
 
 def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
@@ -638,3 +725,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

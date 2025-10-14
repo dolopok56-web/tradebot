@@ -26,14 +26,14 @@ USE_5M_CONFIRM = True
 STRUCT_BARS    = 1
 
 # Минимальные буферы (порог шума)
-MIN_SPREAD = {"BTC": 277.5, "NG": 0.004, "XAU": 0.25}
+MIN_SPREAD = {"BTC": 277.5, "NG": 0.0035, "XAU": 0.25}
 
 # Динамика буфера
-ATR_K   = {"BTC": 7.0, "NG": 0.40, "XAU": 0.55}
-RANGE_K = {"BTC": 0.90, "NG": 0.85, "XAU": 0.90}
+ATR_K   = {"BTC": 7.0, "NG": 0.30, "XAU": 0.55}
+RANGE_K = {"BTC": 0.90, "NG": 0.75, "XAU": 0.90}
 
 # Доп. подушка к уровням TP/SL (поверх buffer)
-BUF_K_TO_LEVEL = {"BTC": 1.15, "NG": 0.25, "XAU": 0.30}
+BUF_K_TO_LEVEL = {"BTC": 1.15, "NG": 0.20, "XAU": 0.30}
 
 # Минимальный RR и ограничение ширины стопа
 RR_MIN     = 1.30
@@ -85,6 +85,30 @@ TRADES_CSV = "gv_trades.csv"
 # Источники цен
 CC_URL     = "https://min-api.cryptocompare.com/data/v2/histominute?fsym=BTC&tsym=USD&limit=200"
 STOOQ_TPL  = "https://stooq.com/q/d/l/?s={ticker}&i=1"
+
+# ---- Локальные пороги только для NATGAS (NG) ----
+RR_MIN_NG         = 1.10      # локальный минимум RR для газа (вместо глобального 1.30)
+CONF_MIN_NG       = 0.55      # локальный порог уверенности (вместо 0.70)
+COOLDOWN_SEC_NG   = 8         # короткий кулдаун для газа
+IMPULSE_PIPS_NG   = 0.010     # минимальный микродвиж за бар (в пунктах NG)
+LOOKBACK_BREAK_NG = 6         # окно для мини-пробоя high/low
+
+# ==== NG strategy pack (Morpher-style) ====
+NG_STRAT_ENABLED        = True      # можно выключить пак целиком
+NG_STRAT_MIN_SCORE      = 2         # минимальное число «согласованных» сигналов
+NG_RSI_OB               = 70        # overbought
+NG_RSI_OS               = 30        # oversold
+NG_BB_WINDOW            = 20        # Bollinger lookback
+NG_BB_K                 = 2.0       # полосы
+NG_MACD_FAST            = 12
+NG_MACD_SLOW            = 26
+NG_MACD_SIGNAL          = 9
+NG_EIA_BLACKOUT_MIN_BEFORE = 30     # не торговать за 30 мин до отчёта
+NG_EIA_BLACKOUT_MIN_AFTER  = 30     # и 30 мин после
+NG_EIA_UTC_HOUR         = 14        # 14:30 UTC (обычно)
+NG_EIA_UTC_MIN          = 30
+NG_EIA_WEEKDAY          = 3         # четверг -> Monday=0 ... Thursday=3
+NG_SEASONAL_MONTHS_BULL = {11,12,1,2,3}  # зима: NOV..MAR
 
 # ===================== STATE =====================
 
@@ -152,6 +176,29 @@ def true_range(h, l, c):
 
 def atr(df, n):
     return true_range(df["High"], df["Low"], df["Close"]).rolling(n).mean()
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / (down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def bollinger(close: pd.Series, n: int = 20, k: float = 2.0):
+    ma = close.rolling(n).mean()
+    std = close.rolling(n).std(ddof=0)
+    upper = ma + k * std
+    lower = ma - k * std
+    width = (upper - lower) / (ma + 1e-12)
+    return ma, upper, lower, width
+
+def macd_line(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - sig
+    return macd, sig, hist
 
 def rnd(sym: str, x: float):
     return round(x, 1 if sym == "BTC" else (4 if sym == "NG" else 2))
@@ -396,29 +443,92 @@ def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
 
 # ===================== STRATEGY =====================
 
+# ===================== NG FEATURES =====================
+
+def _ng_feats(df: pd.DataFrame) -> dict:
+    """
+    Считаем фичи по ПОСЛЕДНЕМУ закрытому бару (iloc[-2]) для NG:
+    - импульс (|Δclose|)
+    - пробой диапазона за LOOKBACK_BREAK_NG баров
+    - EMA-согласование на закрытом баре
+    """
+    c = df["Close"]; h = df["High"]; l = df["Low"]
+
+    last  = df.iloc[-2]   # закрытый бар
+    prev  = df.iloc[-3]   # ещё один назад
+
+    # 1) импульс по close
+    impulse = float(abs(last["Close"] - prev["Close"]))
+    impulse_ok = impulse >= IMPULSE_PIPS_NG
+
+    # 2) пробой max/min за N баров (исключаем 2 последних, чтобы не «подглядывать»)
+    N = int(LOOKBACK_BREAK_NG)
+    hi = float(h.iloc[-(N+2):-2].max()) if len(df) >= N+2 else float("nan")
+    lo = float(l.iloc[-(N+2):-2].min()) if len(df) >= N+2 else float("nan")
+    broke_up = np.isfinite(hi) and (float(last["Close"]) > hi)
+    broke_dn = np.isfinite(lo) and (float(last["Close"]) < lo)
+
+    # 3) EMA согласование на закрытом баре
+    ema_f = ema(c, EMA_FAST)
+    ema_s = ema(c, EMA_SLOW)
+    ema_up = bool(ema_f.iloc[-2] > ema_s.iloc[-2])
+    ema_dn = bool(ema_f.iloc[-2] < ema_s.iloc[-2])
+
+    return {
+        "impulse": impulse,
+        "impulse_ok": impulse_ok,
+        "broke_up": broke_up,
+        "broke_dn": broke_dn,
+        "ema_up": ema_up,
+        "ema_dn": ema_dn,
+    }
+
 def trend_side(df: pd.DataFrame) -> str:
     c = df["Close"]
     return "UP" if ema(c, EMA_FAST).iloc[-1] > ema(c, EMA_SLOW).iloc[-1] else "DOWN"
 
-def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str) -> float:
-    rr_part = max(0.0, min(1.0, (rr - 1.0) / 1.2))
+def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str, feats: dict | None = None) -> float:
+    rr_part    = max(0.0, min(1.0, (rr - 1.0) / 1.2))   # как было: RR 1.0->0 ; 2.2->1
     trend_part = 0.1 if trend_ok else 0.0
     tiny_atr_penalty = 0.05 if atr_now < (MIN_SPREAD.get(symbol, 0.0) * 0.2) else 0.0
+
     conf = rr_part + trend_part - tiny_atr_penalty
+
+    # --- NG-бусты (ТОЛЬКО добавляем, ничего не запрещаем) ---
+    if symbol == "NG" and feats:
+        if feats.get("impulse_ok"):                 # импульсный бар — дай дорогу
+            conf += 0.12
+        if feats.get("broke_up") or feats.get("broke_dn"):  # пробой диапазона
+            conf += 0.10
+        # EMA согласование в сторону тренда (из твоей trend_side)
+        if (feats.get("ema_up") and trend_ok) or (feats.get("ema_dn") and not trend_ok):
+            conf += 0.08
+
     return max(0.0, min(1.0, conf))
 
 def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
-    if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3: return None
+    if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
+        return None
 
     df = df.copy()
     df["ATR"] = atr(df, ATR_PERIOD)
     atr_now = float(df["ATR"].iloc[-1])
-    if not np.isfinite(atr_now) or atr_now <= 0: return None
+    if not np.isfinite(atr_now) or atr_now <= 0:
+        return None
 
+    # тренд + закрытый бар, как у тебя уже есть
     side_tr = trend_side(df)
-    last = df.iloc[-2]                    # закрытый бар
+    last = df.iloc[-2]
     entry = float(last["Close"])
 
+    # --- Локальные пороги для NG ---
+    rr_min   = RR_MIN_NG   if symbol == "NG" else RR_MIN
+    conf_min = CONF_MIN_NG if symbol == "NG" else CONF_MIN
+
+    # NG фичи (импульс/пробой/ema)
+    feats = _ng_feats(df) if symbol == "NG" else None
+
+    # далее твоя логика TP/SL/rr как была...
     p = stats.get(symbol, deepcopy(DEFAULT_PARAMS))
     tp_mul = float(p["tp_mul"]) * float(p["risk"])
     sl_mul = float(p["sl_mul"]) * float(1.0 / p["risk"])
@@ -439,10 +549,12 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
         tp = raw_tp
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-    if rr < RR_MIN: return None
+    if rr < rr_min:
+        return None
 
-    conf = _confidence(rr, True, atr_now, symbol)
-    if conf < CONF_MIN:
+    # --- тут вместо старого вызова _confidence ---
+    conf = _confidence(rr, True, atr_now, symbol, feats)
+    if conf < conf_min:
         return None
 
     signature = sig_id(symbol, side, side_tr, atr_now, tf_label)
@@ -466,6 +578,7 @@ def format_signal(setup, buffer):
     ]
     return "\n".join(lines)
 
+    
 # ===================== LEARNING =====================
 
 def learn(symbol: str, outcome: str, sess: dict):
@@ -491,6 +604,8 @@ def finish_trade(symbol: str, outcome: str, price_now: float):
     sess = trade[symbol]
     trade[symbol] = None
     cooldown_until[symbol] = time.time() + COOLDOWN_SEC
+    if symbol == "NG":
+        cooldown_until[symbol] = time.time() + COOLDOWN_SEC_NG
     if not sess: return
     try:
         rr = (sess["tp"]-sess["entry"]) if sess["side"]=="BUY" else (sess["entry"]-sess["tp"])
@@ -725,4 +840,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

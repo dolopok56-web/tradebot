@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import os, time, json, csv, math, logging, asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from copy import deepcopy
 
 import numpy as np
 import pandas as pd
 import aiohttp
 
-# aiogram 3.x
+# aiogram 3.7+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
@@ -17,39 +17,31 @@ from aiogram.filters import Command
 
 # ===================== CONFIG =====================
 
-VERSION = "v14.2 NG-confluence (stable+)"
+VERSION = "v14.2 NG-fix (yahoo+stooq, NG-local, EIA window)"
 
 BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
 OWNER_ID  = 6784470762
 
+# подтверждение тренда / структура (оставил как есть — резерв)
 USE_5M_CONFIRM = True
 STRUCT_BARS    = 1
 
-# --- базовые (общие) минимальные спрэды/подушки
-MIN_SPREAD = {"BTC": 277.5, "NG": 0.004, "XAU": 0.25}
-
-# динамические буферы
-ATR_K   = {"BTC": 0.80, "NG": 0.40, "XAU": 0.20}
-RANGE_K = {"BTC": 0.35, "NG": 0.85, "XAU": 0.38}
-
+# --- БАЗА (общие значения не менял)
+MIN_SPREAD = {"BTC": 277.5, "NG": 0.006, "XAU": 0.25}
+ATR_K   = {"BTC": 0.80, "NG": 0.40, "XAU": 0.55}
+RANGE_K = {"BTC": 0.35, "NG": 0.85, "XAU": 0.90}
 BUF_K_TO_LEVEL = {"BTC": 1.15, "NG": 0.25, "XAU": 0.30}
 
-# общие
 RR_MIN     = 1.30
 MAX_SL_ATR = 1.40
-CONF_MIN   = 0.70
 
-# --- локальные параметры для NG (не трогают BTC/XAU)
-RR_MIN_NG        = 1.10       # ниже RR можно, чтобы не молчал
-CONF_MIN_NG_BASE = 0.55       # базовый порог NG
-COOLDOWN_NG      = 8          # быстрее перезаход
-IMPULSE_PIPS_NG  = 0.010      # минимальный «ход» бара (из запроса)
-LOOKBACK_BREAK_NG= 6          # пробой max/min за N баров даёт +к уверенности
-ATR_MIN_NG       = 0.0025     # минимум ATR для фильтра тонкого рынка
-
-# окно молчания под EIA (четверг 14:00–15:00 UTC)
-EIA_SILENT_UTC_H1 = 14
-EIA_SILENT_UTC_H2 = 15
+# --- ЛОКАЛЬНЫЕ ПОРОГИ ДЛЯ ГАЗА (мягче, чтобы давал сделки)
+RR_MIN_NG      = 1.10     # min RR только для NG
+CONF_MIN       = 0.70     # общий (как был)
+CONF_MIN_NG    = 0.55     # локальный для NG
+COOLDOWN_NG_S  = 8        # быстрее перезаходы после выхода
+IMPULSE_PIPS_NG = 0.010   # минимум intra-bar импульса для NG
+LOOKBACK_BREAK_NG = 6     # пробой max/min за lookback баров → разрешение
 
 SYMBOLS = {
     "BTC": {"name": "BTC-USD",   "tf": "1m"},
@@ -57,26 +49,36 @@ SYMBOLS = {
     "XAU": {"name": "XAUUSD=X",  "tf": "1m"},
 }
 
+# Периоды
 ATR_PERIOD = 14
 EMA_FAST   = 12
 EMA_SLOW   = 26
 
+# Петля
 POLL_SEC         = 5
 COOLDOWN_SEC     = 20
 GUARD_AFTER_SL_S = 15 * 60
 BOOT_COOLDOWN_S  = 60
 
+# Сеть/ретраи
 HTTP_TIMEOUT = 10
 HTTP_RETRIES = 3
 HTTP_RETRY_SLEEP = 0.8
 
+# Файлы
 STATS_JSON = "gv_stats.json"
 STATE_JSON = "gv_state.json"
 TRADES_CSV = "gv_trades.csv"
 
+# Источники цен
+# BTC — cryptocompare
 CC_URL     = "https://min-api.cryptocompare.com/data/v2/histominute?fsym=BTC&tsym=USD&limit=200"
+
+# Yahoo v8 chart endpoints (NG/XAU)
+YH_TPL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=1m"
+
+# Stooq фолбэк
 STOOQ_TPL  = "https://stooq.com/q/d/l/?s={ticker}&i=1"
-YAHOO_TPL  = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2d&interval=1m"  # для NG и XAU
 
 # ===================== STATE =====================
 
@@ -142,33 +144,11 @@ def true_range(h, l, c):
 def atr(df, n):
     return true_range(df["High"], df["Low"], df["Close"]).rolling(n).mean()
 
-def rsi(series: pd.Series, n=14):
-    delta = series.diff()
-    up = delta.clip(lower=0).rolling(n).mean()
-    down = -delta.clip(upper=0).rolling(n).mean()
-    rs = up / (down + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    sig = macd.ewm(span=signal, adjust=False).mean()
-    hist = macd - sig
-    return macd, sig, hist
-
-def bollinger(series: pd.Series, n=20, k=2.0):
-    ma = series.rolling(n).mean()
-    sd = series.rolling(n).std()
-    upper = ma + k*sd
-    lower = ma - k*sd
-    return ma, upper, lower, sd
-
 def rnd(sym: str, x: float):
-    return round(float(x), 1 if sym == "BTC" else (4 if sym == "NG" else 2))
+    return round(x, 1 if sym == "BTC" else (4 if sym == "NG" else 2))
 
 def sig_id(symbol, side, trend, atr_val, tf):
-    return f"{symbol}|{side}|{trend}|{round(float(atr_val),4)}|{tf}"
+    return f"{symbol}|{side}|{trend}|{round(float(atr_val),1)}|{tf}"
 
 def allow_after_sl(symbol, signature, ts):
     p = stats.get(symbol, deepcopy(DEFAULT_PARAMS))
@@ -203,29 +183,34 @@ def df_from_stooq_csv(text: str):
         from io import StringIO
         df = pd.read_csv(StringIO(text))
         if not {"Open","High","Low","Close"}.issubset(df.columns): return pd.DataFrame()
-        return df.tail(300).reset_index(drop=True)
-    except:
-        return pd.DataFrame()
-
-async def _get_df_yahoo_v8(session: aiohttp.ClientSession, ticker: str) -> pd.DataFrame:
-    # пример тикеров: NG=F, XAUUSD=X
-    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-           f"?range=4h&interval=1m&events=history&includePrePost=true")
-    data = await _http_get_json(session, url)
-    try:
-        chart = data.get("chart", {})
-        result = chart.get("result", [])[0]
-        ts = result["timestamp"]
-        quote = result["indicators"]["quote"][0]
-        o = quote["open"]; h = quote["high"]; l = quote["low"]; c = quote["close"]
-        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=ts)
-        df = df.replace([None, np.inf, -np.inf], np.nan).dropna()
-        if df.empty: 
-            return pd.DataFrame()
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
         return df.tail(300).reset_index(drop=True)
     except Exception:
-        logging.warning(f"Yahoo v8 parse fail {ticker}")
         return pd.DataFrame()
+
+def df_from_yahoo_v8(js: dict) -> pd.DataFrame:
+    try:
+        chart = js.get("chart", {})
+        result = (chart.get("result") or [None])[0]
+        if result is None: return pd.DataFrame()
+        ts = result["timestamp"]               # unix
+        q  = result["indicators"]["quote"][0]  # dict with open/high/low/close
+        df = pd.DataFrame({
+            "Open":  q["open"],
+            "High":  q["high"],
+            "Low":   q["low"],
+            "Close": q["close"],
+        })
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
+        df = df.tail(300).reset_index(drop=True)
+        return df
+    except Exception as e:
+        logging.warning(f"Yahoo v8 parse error: {e}")
+        return pd.DataFrame()
+
+async def _get_df_yahoo(session: aiohttp.ClientSession, ticker: str) -> pd.DataFrame:
+    js = await _http_get_json(session, YH_TPL.format(ticker=ticker))
+    return df_from_yahoo_v8(js)
 
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     if symbol == "BTC":
@@ -234,72 +219,42 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
             if data.get("Response") != "Success": return pd.DataFrame()
             arr = data["Data"]["Data"]
             df = pd.DataFrame(arr)
+            if "time" in df.columns:
+                last_ts = int(df["time"].iloc[-1])
+                last_candle_close_ts["BTC"] = last_ts
             df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"}, inplace=True)
-            df = df[["Open","High","Low","Close"]].replace([None, np.inf, -np.inf], np.nan).dropna()
-            return df.tail(300).reset_index(drop=True)
+            return df[["Open","High","Low","Close"]].tail(300).reset_index(drop=True)
         except Exception as e:
             logging.warning(f"BTC df parse error: {e}")
             return pd.DataFrame()
 
     if symbol == "NG":
-        # 1) Yahoo v8 — NG=F
-        df = await _get_df_yahoo_v8(session, "NG=F")
+        # 1) Yahoo NG=F
+        df = await _get_df_yahoo(session, "NG%3DF")
         if not df.empty:
-            return df
-        # 2) fallback stooq — ng.f
-        txt = await _http_get_text(session, STOOQ_TPL.format(ticker="ng.f"))
-        df = df_from_stooq_csv(txt)
-        if not df.empty:
-            return df
-        logging.error("NG feed: BOTH Yahoo+stooq EMPTY")
-        return pd.DataFrame()
-
-    if symbol == "XAU":
-        # 1) Yahoo v8 — XAUUSD=X
-        df = await _get_df_yahoo_v8(session, "XAUUSD=X")
-        if not df.empty:
-            return df
-        # 2) fallback stooq — xauusd
-        txt = await _http_get_text(session, STOOQ_TPL.format(ticker="xauusd"))
-        df = df_from_stooq_csv(txt)
-        if not df.empty:
-            return df
-        logging.error("XAU feed: BOTH Yahoo+stooq EMPTY")
-        return pd.DataFrame()
-
-    return pd.DataFrame()
-
-    if symbol == "NG":
-        # пробуем Yahoo v8
-        j = await _http_get_json(session, YAHOO_TPL.format(ticker="NG=F"))
-        df = df_from_yahoo_json(j)
-        if not df.empty: 
             last_candle_close_ts["NG"] = int(time.time())
             return df
-        # фолбэк stooq
+        # 2) stooq fallback (ng.f)
         txt = await _http_get_text(session, STOOQ_TPL.format(ticker="ng.f"))
         df = df_from_stooq_csv(txt)
-        if not df.empty: 
-            last_candle_close_ts["NG"] = int(time.time())
+        if not df.empty: last_candle_close_ts["NG"] = int(time.time())
         return df
 
     if symbol == "XAU":
-        j = await _http_get_json(session, YAHOO_TPL.format(ticker="XAUUSD=X"))
-        df = df_from_yahoo_json(j)
-        if not df.empty: 
+        df = await _get_df_yahoo(session, "XAUUSD%3DX")
+        if not df.empty:
             last_candle_close_ts["XAU"] = int(time.time())
             return df
         txt = await _http_get_text(session, STOOQ_TPL.format(ticker="xauusd"))
         df = df_from_stooq_csv(txt)
-        if not df.empty: 
-            last_candle_close_ts["XAU"] = int(time.time())
+        if not df.empty: last_candle_close_ts["XAU"] = int(time.time())
         return df
 
     return pd.DataFrame()
 
 def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
     try:
-        rng = float(df["High"].iloc[-2] - df["Low"].iloc[-2])
+        rng = float(df["High"].iloc[-2] - df["Low"].iloc[-2])  # закрытый бар
     except Exception:
         rng = 0.0
     base = MIN_SPREAD.get(symbol, 0.0)
@@ -309,27 +264,55 @@ def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
 
 # ===================== STRATEGY =====================
 
+def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str) -> float:
+    rr_part = max(0.0, min(1.0, (rr - 1.0) / 1.2))  # RR 1.0->0 ; 2.2->1
+    trend_part = 0.1 if trend_ok else 0.0
+    tiny_atr_penalty = 0.05 if atr_now < (MIN_SPREAD.get(symbol, 0.0) * 0.2) else 0.0
+    conf = rr_part + trend_part - tiny_atr_penalty
+    return max(0.0, min(1.0, conf))
+
 def trend_side(df: pd.DataFrame) -> str:
     c = df["Close"]
     return "UP" if ema(c, EMA_FAST).iloc[-1] > ema(c, EMA_SLOW).iloc[-1] else "DOWN"
 
-def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str) -> float:
-    rr_part = max(0.0, min(1.0, (rr - 1.0) / 1.2))
-    trend_part = 0.1 if trend_ok else 0.0
-    tiny_atr_penalty = 0.05 if (symbol=="NG" and atr_now < ATR_MIN_NG) else 0.0
-    conf = rr_part + trend_part - tiny_atr_penalty
-    return max(0.0, min(1.0, conf))
+def _ng_extra_pass(df: pd.DataFrame) -> bool:
+    """Доп. допуск для NG: импульс и/или пробой за lookback."""
+    # импульс закрытого бара
+    last = df.iloc[-2]
+    impulse = abs(float(last["Close"]) - float(df["Close"].iloc[-3]))
+    if impulse >= IMPULSE_PIPS_NG:
+        return True
+    # пробой max/min за LOOKBACK_BREAK_NG
+    look = df.iloc[-(LOOKBACK_BREAK_NG+1):-1]
+    c = float(last["Close"])
+    if c >= float(look["High"].max()) or c <= float(look["Low"].min()):
+        return True
+    return False
+
+def _is_eia_blackout_utc(ts=None) -> bool:
+    """Чёрное окно EIA: четверг 14:00–15:00 UTC (безопасный коридор)."""
+    dt = datetime.utcnow() if ts is None else datetime.utcfromtimestamp(ts)
+    if dt.weekday() == 3:  # Thursday
+        hhmm = dt.hour*60 + dt.minute
+        return 14*60 <= hhmm < 15*60
+    return False
 
 def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
-    if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3: return None
+    if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3: 
+        return None
+
+    # EIA blackout только для NG
+    if symbol == "NG" and _is_eia_blackout_utc():
+        return None
 
     df = df.copy()
     df["ATR"] = atr(df, ATR_PERIOD)
     atr_now = float(df["ATR"].iloc[-1])
-    if not np.isfinite(atr_now) or atr_now <= 0: return None
+    if not np.isfinite(atr_now) or atr_now <= 0: 
+        return None
 
     side_tr = trend_side(df)
-    last = df.iloc[-2]
+    last = df.iloc[-2]                    # закрытый бар
     entry = float(last["Close"])
 
     p = stats.get(symbol, deepcopy(DEFAULT_PARAMS))
@@ -352,25 +335,27 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
         tp = raw_tp
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-    rr_min_local = RR_MIN_NG if symbol=="NG" else RR_MIN
-    if rr < rr_min_local: return None
+
+    # RR и Conf: для NG — мягче
+    rr_min = RR_MIN_NG if symbol == "NG" else RR_MIN
+    if rr < rr_min: 
+        return None
+
+    conf_raw = _confidence(rr, True, atr_now, symbol)
+    conf_min = CONF_MIN_NG if symbol == "NG" else CONF_MIN
+    if conf_raw < conf_min:
+        return None
+
+    # Доп. NG-фильтр (импульс/пробой) — даёт больше входов
+    if symbol == "NG" and not _ng_extra_pass(df):
+        return None
 
     signature = sig_id(symbol, side, side_tr, atr_now, tf_label)
-
-    # добавим индикаторы в df (для NG-фильтров тоже пригодятся)
-    c = df["Close"]
-    df["RSI"] = rsi(c, 14)
-    _, _, macdh = macd(c, 12, 26, 9)
-    df["MACD_H"] = macdh
-    ma, upper, lower, sd = bollinger(c, 20, 2.0)
-    df["BB_MA"], df["BB_U"], df["BB_L"], df["BB_SD"] = ma, upper, lower, sd
-
     return {
         "symbol": symbol, "tf": tf_label,
         "side": side, "trend": side_tr,
         "entry": entry, "tp": tp, "sl": sl,
-        "atr": atr_now, "rr": rr, "sig": signature,
-        "ind_df": df  # прокинем для NG-конфлюенса
+        "atr": atr_now, "rr": rr, "conf": conf_raw, "sig": signature
     }
 
 def format_signal(setup, buffer):
@@ -382,93 +367,9 @@ def format_signal(setup, buffer):
         f"🔥 {side} {SYMBOLS[sym]['name']} | {tf}",
         f"✅ TP: **{rnd(sym, tp)}**",
         f"🟥 SL: **{rnd(sym, sl)}**",
-        f"Entry: {rnd(sym, setup['entry'])}  Spread≈{rnd(sym, buffer)}  ATR(14)≈{rnd(sym, setup['atr'])}  Conf: —  Trend: {setup['trend']}"
+        f"Entry: {rnd(sym, setup['entry'])}  Spread≈{rnd(sym, buffer)}  ATR(14)≈{rnd(sym, setup['atr'])}  Conf: {int(setup['conf']*100)}%  Trend: {setup['trend']}"
     ]
     return "\n".join(lines)
-
-# ======= NG Confluence filters =======
-
-def _is_eia_quiet_now(ts_utc: float) -> bool:
-    dt = datetime.utcfromtimestamp(ts_utc)
-    # четверг = 3 (Mon=0)
-    if dt.weekday() != 3:
-        return False
-    return EIA_SILENT_UTC_H1 <= dt.hour < EIA_SILENT_UTC_H2
-
-def _seasonal_conf_boost(ts_utc: float) -> float:
-    m = datetime.utcfromtimestamp(ts_utc).month
-    # Ноябрь–март: немного снижаем порог уверенности (зима)
-    return 0.05 if m in (11,12,1,2,3) else 0.0
-
-def ng_confluence_ok(setup: dict) -> bool:
-    df = setup["ind_df"]
-    if df is None or df.empty: return False
-
-    now_ts = time.time()
-    # EIA quiet window
-    if _is_eia_quiet_now(now_ts):
-        return False
-
-    # ATR фильтр
-    atr_now = float(df["ATR"].iloc[-1])
-    if atr_now < ATR_MIN_NG:
-        return False
-
-    side = setup["side"]
-    rsi_now = float(df["RSI"].iloc[-2])
-    macdh_now = float(df["MACD_H"].iloc[-2])
-    macdh_prev = float(df["MACD_H"].iloc[-3])
-    close = float(df["Close"].iloc[-2])
-    bb_u = float(df["BB_U"].iloc[-2])
-    bb_l = float(df["BB_L"].iloc[-2])
-    bb_sd = float(df["BB_SD"].iloc[-2])
-
-    # импульс бара
-    last_range = float(df["High"].iloc[-2] - df["Low"].iloc[-2])
-    if last_range < IMPULSE_PIPS_NG:
-        return False
-
-    score = 0.0
-
-    # RSI зоны
-    if side == "BUY" and rsi_now <= 55:
-        score += 0.2
-    if side == "SELL" and rsi_now >= 45:
-        score += 0.2
-
-    # MACD гист: направление
-    if side == "BUY" and macdh_now > macdh_prev:
-        score += 0.25
-    if side == "SELL" and macdh_now < macdh_prev:
-        score += 0.25
-
-    # Боллинджер: пробой полос
-    if side == "BUY" and close > bb_u:
-        score += 0.25
-    if side == "SELL" and close < bb_l:
-        score += 0.25
-
-    # «анти-сжатие»: расширение волатильности
-    if bb_sd > 0 and (bb_sd / max(df["BB_SD"].rolling(10).mean().iloc[-2], 1e-9)) > 1.05:
-        score += 0.10
-
-    # пробой локальных экстремумов
-    lb = LOOKBACK_BREAK_NG
-    hi_break = close >= float(df["High"].iloc[-(lb+1):-1].max())
-    lo_break = close <= float(df["Low"].iloc[-(lb+1):-1].min())
-    if side == "BUY" and hi_break: score += 0.20
-    if side == "SELL" and lo_break: score += 0.20
-
-    # базовая уверенность от RR/тренда
-    conf_base = _confidence(setup["rr"], setup["trend"] == ("UP" if side=="BUY" else "DOWN"), atr_now, "NG")
-    score += conf_base * 0.3
-
-    # сезонный буст
-    score += _seasonal_conf_boost(now_ts)
-
-    # итоговый порог
-    need = CONF_MIN_NG_BASE
-    return score >= need
 
 # ===================== LEARNING =====================
 
@@ -494,7 +395,12 @@ def learn(symbol: str, outcome: str, sess: dict):
 def finish_trade(symbol: str, outcome: str, price_now: float):
     sess = trade[symbol]
     trade[symbol] = None
-    cooldown_until[symbol] = time.time() + (COOLDOWN_NG if symbol=="NG" else COOLDOWN_SEC)
+    # локальный кулдаун для NG
+    if symbol == "NG":
+        cooldown_until[symbol] = time.time() + COOLDOWN_NG_S
+    else:
+        cooldown_until[symbol] = time.time() + COOLDOWN_SEC
+
     if not sess: return
     try:
         rr = (sess["tp"]-sess["entry"]) if sess["side"]=="BUY" else (sess["entry"]-sess["tp"])
@@ -544,7 +450,7 @@ async def cmd_help(m: Message):
         "• стоп — стоп и короткий кулдаун\n"
         "• статус — диагностика\n"
         "• отчет — 10 последних закрытий (только владелец)\n"
-        "• тест — формат сигнала"
+        "• тест — вывести тест-сигнал (диагностика форматирования)"
     )
 
 @router.message(F.text.lower() == "биток")
@@ -590,10 +496,10 @@ async def cmd_report(m: Message):
 @router.message(F.text.lower() == "тест")
 async def cmd_test(m: Message):
     text = (
-        "🔥 BUY NG=F | 1m\n"
-        "✅ TP: **3.0990**\n"
-        "🟥 SL: **3.0880**\n"
-        "Entry: 3.0930  Spread≈0.0060  ATR(14)≈0.0040  Conf: —  Trend: UP"
+        "🔥 BUY BTC-USD | 1m\n"
+        "✅ TP: **114999.9**\n"
+        "🟥 SL: **114111.1**\n"
+        "Entry: 114555.5  Spread≈350.0  ATR(14)≈45.0  Conf: 72%  Trend: UP"
     )
     await m.answer(text)
 
@@ -601,19 +507,25 @@ async def cmd_test(m: Message):
 
 async def send_signal(symbol: str, setup: dict, buffer: float):
     try: await bot.send_message(OWNER_ID, format_signal(setup, buffer))
-    except: pass
+    except Exception as e: logging.warning(f"send_signal fail: {e}")
 
 async def notify_hit(symbol: str, outcome: str, price: float):
     name = SYMBOLS[symbol]["name"]; p = rnd(symbol, price)
     text = f"✅ TP hit on {name} @ {p}" if outcome=="TP" else f"🟥 SL hit on {name} @ {p}"
     try: await bot.send_message(OWNER_ID, text)
-    except: pass
+    except Exception as e: logging.warning(f"notify fail: {e}")
 
 # ===================== ENGINE =====================
 
 def _active_symbols_for_mode(md: str):
-    if md == "AUTO": return ["NG","XAU"]
-    if md in ("BTC","NG","XAU"): return [md]
+    if md == "AUTO":
+        return ["NG","XAU"]
+    if md == "BTC":
+        return ["BTC"]
+    if md == "NG":
+        return ["NG"]
+    if md == "XAU":
+        return ["XAU"]
     return ["BTC"]
 
 def _apply_mode_change_if_needed():
@@ -628,21 +540,22 @@ def _apply_mode_change_if_needed():
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     global last_candle_close_ts, last_seen_idx, last_signal_idx
 
-    if mode != "AUTO" and mode != symbol: return
-
-    df = await get_df(session, symbol)
-    if df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
+    if mode != "AUTO" and mode != symbol: 
         return
 
-    last_candle_close_ts[symbol] = time.time()
-    atr_now = float(atr(df, ATR_PERIOD).iloc[-1])
-    state[f"atr_{symbol}"] = rnd(symbol, atr_now)
+    df = await get_df(session, symbol)
 
+    # heartbeat + atr в state (даже если пусто — увидим проблему)
+    atr_now = float(atr(df, ATR_PERIOD).iloc[-1]) if (not df.empty and len(df) > ATR_PERIOD) else float('nan')
+    state[f"atr_{symbol}"] = rnd(symbol, atr_now) if np.isfinite(atr_now) else "—"
     try:
-        last_close = rnd(symbol, float(df['Close'].iloc[-1]))
-    except:
+        last_close = rnd(symbol, float(df['Close'].iloc[-1])) if not df.empty else -1
+    except Exception:
         last_close = -1
-    logging.info(f"HB {symbol}: last_close={last_close} ATR≈{rnd(symbol, atr_now)}")
+    logging.info(f"HB {symbol}: last_close={last_close} ATR≈{state[f'atr_{symbol}']}")
+
+    if df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
+        return
 
     cur_idx = len(df) - 1
     closed_idx = cur_idx - 1
@@ -650,7 +563,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         return
     last_seen_idx[symbol] = closed_idx
 
-    # активная позиция
+    # если сделка открыта — TP/SL по High/Low ПОСЛЕ входа
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))
@@ -666,29 +579,27 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
             if hit_tp:
                 price_now = float(post["Close"].iloc[-1])
                 await notify_hit(symbol, "TP", price_now)
-                finish_trade(symbol, "TP", price_now); return
+                finish_trade(symbol, "TP", price_now)
+                return
             if hit_sl:
                 price_now = float(post["Close"].iloc[-1])
                 await notify_hit(symbol, "SL", price_now)
-                finish_trade(symbol, "SL", price_now); return
+                finish_trade(symbol, "SL", price_now)
+                return
         return
 
     # анти вход сразу после старта + кулдаун
     if time.time() - boot_ts < BOOT_COOLDOWN_S: return
-    if time.time() < cooldown_until[symbol]: return
+    if time.time() < cooldown_until[symbol]:   return
 
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"])
     if not setup: return
-
-    # NG: дополнительная конфлюенс-проверка
-    if symbol == "NG" and not ng_confluence_ok(setup):
-        return
 
     if last_signal_idx[symbol] == closed_idx:
         return
     last_signal_idx[symbol] = closed_idx
 
-    if not allow_after_sl(symbol, setup["sig"], time.time()):
+    if not allow_after_sl(symbol, setup["sig"], time.time()): 
         return
 
     base_buffer = dynamic_buffer(symbol, df, setup["atr"])
@@ -736,4 +647,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-

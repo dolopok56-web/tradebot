@@ -611,7 +611,7 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
         return None
 
     df["ATR"] = atr(df, ATR_PERIOD)
-    atr_now = float(df["ATR"].iloc[-1]
+    atr_now = float(df["ATR"].iloc[-1])
     # ...
     # >>> NG: порог по ATR
     if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
@@ -973,6 +973,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 
 

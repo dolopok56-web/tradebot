@@ -683,13 +683,14 @@ else:
 
     conf = max(0.0, min(1.0, conf + nowcast_extra))
 
-    signature = sig_id(symbol, side, side_tr, atr_now, tf_label)
+    signature = sig_id(symbol, side_tr, side_tr, atr_now, tf_label)
     return {
         "symbol": symbol, "tf": tf_label,
-        "side": side, "trend": side_tr,
+        "side": side_tr, "trend": side_tr,
         "entry": entry, "tp": tp, "sl": sl,
-        "atr": atr_now, "rr": rr, "conf": conf, "sig": signature
+        "atr": atr_now, "rr": rr_base, "conf": conf, "sig": signature,
     }
+
 
 def format_signal(setup, buffer):
     sym = setup["symbol"]; side = setup["side"]; tf = setup["tf"]
@@ -973,6 +974,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 
 

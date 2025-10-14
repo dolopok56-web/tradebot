@@ -28,6 +28,9 @@ STRUCT_BARS    = 1
 # Минимальные буферы (порог шума)
 MIN_SPREAD = {"BTC": 277.5, "NG": 0.0030, "XAU": 0.25}
 
+# Минимально допустимый ATR для входов (локально по инструментам)
+ATR_MIN = {"BTC": 0.0, "NG": 0.025, "XAU": 0.0}   # NG => 0.025 (25 "пипсов")
+
 # Динамика буфера
 ATR_K   = {"BTC": 7.0, "NG": 0.30, "XAU": 0.55}
 RANGE_K = {"BTC": 0.90, "NG": 0.75, "XAU": 0.90}
@@ -162,6 +165,15 @@ def append_trade(row):
         w.writerow(row)
 
 # ===================== TECH =====================
+
+def _sigmoid(x: float) -> float:
+    try:
+        return 1.0 / (1.0 + math.exp(-float(x)))
+    except Exception:
+        return 0.5
+
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
 
 def now_iso():
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
@@ -506,6 +518,88 @@ def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str, feats: d
 
     return max(0.0, min(1.0, conf))
 
+def _ng_feats(df: pd.DataFrame) -> dict:
+    """
+    Лёгкий nowcast для NG на основе последних закрытых баров.
+    Возвращает {'p_up': 0..1}. Безопасно работает при нехватке данных.
+    """
+    feats = {"p_up": 0.5}
+    try:
+        if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 5:
+            return feats
+
+        # работаем по ЗАКРЫТОМУ бару
+        closed = len(df) - 2
+        if closed < 4:
+            return feats
+
+        c = df["Close"].astype(float).values
+        o = df["Open"].astype(float).values if "Open" in df.columns else c
+        h = df["High"].astype(float).values if "High" in df.columns else c
+        l = df["Low"].astype(float).values  if "Low"  in df.columns else c
+
+        # EMA
+        ser_c = pd.Series(c)
+        ema_fast = ser_c.ewm(span=EMA_FAST, adjust=False).mean().values
+        ema_slow = ser_c.ewm(span=EMA_SLOW, adjust=False).mean().values
+
+        # ATR (как в твоей функции atr)
+        df_tmp = df.copy()
+        df_tmp["ATR"] = atr(df_tmp, ATR_PERIOD)
+        atr_now = float(df_tmp["ATR"].iloc[closed])
+        if not np.isfinite(atr_now) or atr_now <= 0:
+            return feats
+
+        # --- Фичи ---
+        # 1) импульс/ускорение (нормируем ATR)
+        r1 = c[closed]   - c[closed-1]
+        r2 = c[closed-1] - c[closed-2]
+        accel = (r1 - r2) / max(atr_now, 1e-12)
+
+        # 2) наклоны EMA (по 3 бара)
+        slope_fast = (ema_fast[closed] - ema_fast[closed-2]) / max(atr_now, 1e-12)
+        slope_slow = (ema_slow[closed] - ema_slow[closed-2]) / max(atr_now, 1e-12)
+        ema_combo = slope_fast + 0.7 * slope_slow
+
+        # 3) расширение волатильности
+        atr_ref = float(pd.Series(df_tmp["ATR"]).rolling(20).mean().iloc[closed])
+        vol_expand = 0.0
+        if np.isfinite(atr_ref) and atr_ref > 0:
+            vol_expand = (atr_now / atr_ref) - 1.0   # >0 — расширение
+
+        # 4) «предпробой» к лок. хай/лоу
+        N = 12
+        window_c = c[closed-N:closed+1]
+        prebreak_up   = (c[closed] - window_c.min()) / max(atr_now, 1e-12)
+        prebreak_down = (window_c.max() - c[closed]) / max(atr_now, 1e-12)
+        prebreak = prebreak_up - prebreak_down  # >0 ближе к high
+
+        # 5) свечная "тяжесть"
+        body = abs(c[closed-1] - o[closed-1])
+        rng  = max(h[closed-1] - l[closed-1], 1e-12)
+        upper = h[closed-1] - max(c[closed-1], o[closed-1])
+        lower = min(c[closed-1], o[closed-1]) - l[closed-1]
+        # bias: для лонга хорошо, когда нижняя тень больше и close ближе к high
+        candle_bias = ((lower - upper) / rng) + ((c[closed-1] - l[closed-1]) / rng - 0.5)
+
+        # --- Скор ---
+        w1, w2, w3, w4, w5 = 2.4, 2.0, 1.8, 1.2, 0.8
+        score = (
+            w1 * accel +
+            w2 * ema_combo +
+            w3 * prebreak +
+            w4 * vol_expand +
+            w5 * candle_bias
+        )
+
+        p_up = _sigmoid(score)
+        feats["p_up"] = _clip01(p_up)
+
+    except Exception:
+        pass
+
+    return feats
+
 def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
         return None
@@ -516,10 +610,21 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if not np.isfinite(atr_now) or atr_now <= 0:
         return None
 
+    df["ATR"] = atr(df, ATR_PERIOD)
+    atr_now = float(df["ATR"].iloc[-1]
+    # ...
+    # >>> NG: порог по ATR
+    if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
+        return None
+
     # тренд + закрытый бар, как у тебя уже есть
     side_tr = trend_side(df)
     last = df.iloc[-2]
     entry = float(last["Close"])
+    
+    feats = None
+    if symbol == "NG":
+        feats = _ng_feats(df)
 
     # --- Локальные пороги для NG ---
     rr_min   = RR_MIN_NG   if symbol == "NG" else RR_MIN
@@ -552,10 +657,31 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if rr < rr_min:
         return None
 
+    # >>> NG: бонус к уверенности от nowcast
+if symbol == "NG" and feats:
+    p_up = float(feats.get("p_up", 0.5))
+    if side == "BUY" and p_up >= 0.58:
+        # маленький буст, чтобы "раньше видеть"
+        extra = 0.10
+        # чуть сильнее, если ATR тоже не "сопля" (в 1.1+ от среднего)
+        extra += 0.05 if p_up >= 0.66 else 0.0
+        # применим позже, после вычисления базового conf
+        nowcast_extra = extra
+    elif side == "SELL" and p_up <= 0.42:
+        extra = 0.10
+        extra += 0.05 if p_up <= 0.34 else 0.0
+        nowcast_extra = extra
+    else:
+        nowcast_extra = 0.0
+else:
+    nowcast_extra = 0.0
+
     # --- тут вместо старого вызова _confidence ---
     conf = _confidence(rr, True, atr_now, symbol, feats)
     if conf < conf_min:
         return None
+
+    conf = max(0.0, min(1.0, conf + nowcast_extra))
 
     signature = sig_id(symbol, side, side_tr, atr_now, tf_label)
     return {
@@ -749,7 +875,14 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
 
     last_candle_close_ts[symbol] = time.time()
     atr_now = float(atr(df, ATR_PERIOD).iloc[-1])
-    state[f"atr_{symbol}"] = rnd(symbol, atr_now)
+    val = rnd(symbol, atr_now)
+
+    # >>> NG: пометка если ATR ниже минимального порога
+    if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
+        state[f"atr_{symbol}"] = f"{val} (low)"
+    else:
+        state[f"atr_{symbol}"] = val
+
 
     logging.info(f"HB {symbol}: last_close={rnd(symbol, float(df['Close'].iloc[-1]))} ATR≈{rnd(symbol, atr_now)}")
 
@@ -840,6 +973,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 
 

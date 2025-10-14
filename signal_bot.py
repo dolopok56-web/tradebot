@@ -207,21 +207,24 @@ def df_from_stooq_csv(text: str):
     except:
         return pd.DataFrame()
 
-def df_from_yahoo_json(j: dict):
+async def _get_df_yahoo_v8(session: aiohttp.ClientSession, ticker: str) -> pd.DataFrame:
+    # пример тикеров: NG=F, XAUUSD=X
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+           f"?range=4h&interval=1m&events=history&includePrePost=true")
+    data = await _http_get_json(session, url)
     try:
-        res = j.get("chart",{}).get("result",[])
-        if not res: return pd.DataFrame()
-        r = res[0]
-        closes = r["indicators"]["quote"][0]["close"]
-        highs  = r["indicators"]["quote"][0]["high"]
-        lows   = r["indicators"]["quote"][0]["low"]
-        opens  = r["indicators"]["quote"][0]["open"]
-        ts     = r["timestamp"]
-        df = pd.DataFrame({"Open":opens,"High":highs,"Low":lows,"Close":closes,"ts":ts})
-        df = df.dropna().tail(300).reset_index(drop=True)
-        return df[["Open","High","Low","Close"]]
-    except Exception as e:
-        logging.warning(f"Yahoo parse fail: {e}")
+        chart = data.get("chart", {})
+        result = chart.get("result", [])[0]
+        ts = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
+        o = quote["open"]; h = quote["high"]; l = quote["low"]; c = quote["close"]
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=ts)
+        df = df.replace([None, np.inf, -np.inf], np.nan).dropna()
+        if df.empty: 
+            return pd.DataFrame()
+        return df.tail(300).reset_index(drop=True)
+    except Exception:
+        logging.warning(f"Yahoo v8 parse fail {ticker}")
         return pd.DataFrame()
 
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
@@ -231,14 +234,40 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
             if data.get("Response") != "Success": return pd.DataFrame()
             arr = data["Data"]["Data"]
             df = pd.DataFrame(arr)
-            if "time" in df.columns:
-                last_ts = int(df["time"].iloc[-1])
-                last_candle_close_ts["BTC"] = last_ts
             df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"}, inplace=True)
-            return df[["Open","High","Low","Close"]].tail(300).reset_index(drop=True)
+            df = df[["Open","High","Low","Close"]].replace([None, np.inf, -np.inf], np.nan).dropna()
+            return df.tail(300).reset_index(drop=True)
         except Exception as e:
             logging.warning(f"BTC df parse error: {e}")
             return pd.DataFrame()
+
+    if symbol == "NG":
+        # 1) Yahoo v8 — NG=F
+        df = await _get_df_yahoo_v8(session, "NG=F")
+        if not df.empty:
+            return df
+        # 2) fallback stooq — ng.f
+        txt = await _http_get_text(session, STOOQ_TPL.format(ticker="ng.f"))
+        df = df_from_stooq_csv(txt)
+        if not df.empty:
+            return df
+        logging.error("NG feed: BOTH Yahoo+stooq EMPTY")
+        return pd.DataFrame()
+
+    if symbol == "XAU":
+        # 1) Yahoo v8 — XAUUSD=X
+        df = await _get_df_yahoo_v8(session, "XAUUSD=X")
+        if not df.empty:
+            return df
+        # 2) fallback stooq — xauusd
+        txt = await _http_get_text(session, STOOQ_TPL.format(ticker="xauusd"))
+        df = df_from_stooq_csv(txt)
+        if not df.empty:
+            return df
+        logging.error("XAU feed: BOTH Yahoo+stooq EMPTY")
+        return pd.DataFrame()
+
+    return pd.DataFrame()
 
     if symbol == "NG":
         # пробуем Yahoo v8
@@ -707,3 +736,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

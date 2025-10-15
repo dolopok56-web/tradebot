@@ -27,10 +27,10 @@ USE_5M_CONFIRM = True
 STRUCT_BARS    = 1
 
 # Минимальные буферы (порог шума)
-MIN_SPREAD = {"BTC": 277.5, "NG": 0.0030, "XAU": 0.25}
+MIN_SPREAD = {"BTC": 277.5, "NG": 0.0020, "XAU": 0.25}
 
 # Минимально допустимый ATR для входов
-ATR_MIN = {"BTC": 0.0, "NG": 0.0025, "XAU": 0.0}
+ATR_MIN = {"BTC": 0.0, "NG": 0.0020, "XAU": 0.0}
 
 # Динамика буфера
 ATR_K   = {"BTC": 7.0, "NG": 0.30, "XAU": 0.55}
@@ -937,3 +937,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

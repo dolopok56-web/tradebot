@@ -17,19 +17,20 @@ from aiogram.filters import Command
 
 # ===================== CONFIG =====================
 
-VERSION = "v14.1 hotfix6 (NG feed backoff+fallback)"
+VERSION = "v14.2 stable (ideas+signals, robust feeds)"
 
 BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
 OWNER_ID  = 6784470762
 
+# подтверждение тренда / пробой структуры (зарезервировано)
 USE_5M_CONFIRM = True
 STRUCT_BARS    = 1
 
 # Минимальные буферы (порог шума)
 MIN_SPREAD = {"BTC": 277.5, "NG": 0.0030, "XAU": 0.25}
 
-# Минимально допустимый ATR для входов (локально по инструментам)
-ATR_MIN = {"BTC": 0.0, "NG": 0.010, "XAU": 0.0}   # NG => 0.025 (25 "пипсов")
+# Минимально допустимый ATR для входов
+ATR_MIN = {"BTC": 0.0, "NG": 0.0025, "XAU": 0.0}
 
 # Динамика буфера
 ATR_K   = {"BTC": 7.0, "NG": 0.30, "XAU": 0.55}
@@ -38,20 +39,19 @@ RANGE_K = {"BTC": 0.90, "NG": 0.75, "XAU": 0.90}
 # Доп. подушка к уровням TP/SL (поверх buffer)
 BUF_K_TO_LEVEL = {"BTC": 1.15, "NG": 0.20, "XAU": 0.30}
 
-# Минимальный RR и ограничение ширины стопа
+# Минимальный RR и ограничение ширины стопа (глобальные)
 RR_MIN     = 1.10
 MAX_SL_ATR = 1.40
 
-# ---------- Idea / trade thresholds ----------
-CONF_MIN_IDEA    = 0.15   # >= этого — шлём идею (но не открываем сделку)
-CONF_MIN_TRADE   = 0.50   # >= этого — "боевой" сигнал (открываем сделку)
+# ---- «Идеи» vs «боевые» входы ----
+CONF_MIN_IDEA   = 0.10   # от этого — присылаем ИДЕЮ (без открытия сессии)
+CONF_MIN_TRADE  = 0.50   # от этого — отправляем полноценный СИГНАЛ (открываем сессию)
 
-# Idea anti-spam
-SEND_IDEAS       = True
-IDEA_COOLDOWN_SEC = 120   # минимум секунд между идеями по одному инструменту
-MAX_IDEAS_PER_HOUR = 10   # лимит идей в час по символу
+SEND_IDEAS          = True
+IDEA_COOLDOWN_SEC   = 120
+MAX_IDEAS_PER_HOUR  = 10
 
-# Порог допуска по «уверенности»
+# Порог уверенности (базовый)
 CONF_MIN = 0.55
 
 SYMBOLS = {
@@ -65,7 +65,7 @@ ATR_PERIOD = 10
 EMA_FAST   = 9
 EMA_SLOW   = 21
 
-# Тик-цикл
+# Петля
 POLL_SEC         = 5
 COOLDOWN_SEC     = 12
 GUARD_AFTER_SL_S = 15 * 60
@@ -84,10 +84,6 @@ COMMON_HEADERS = {
     "Accept": "*/*",
     "Connection": "keep-alive",
 }
-YA_URLS = [
-    "https://query1.finance.yahoo.com",
-    "https://query2.finance.yahoo.com",
-]
 
 # Файлы
 STATS_JSON = "gv_stats.json"
@@ -96,14 +92,13 @@ TRADES_CSV = "gv_trades.csv"
 
 # Источники цен
 CC_URL     = "https://min-api.cryptocompare.com/data/v2/histominute?fsym=BTC&tsym=USD&limit=200"
-STOOQ_TPL  = "https://stooq.com/q/d/l/?s={ticker}&i=1"
 
 # ---- Локальные пороги только для NATGAS (NG) ----
-RR_MIN_NG         = 1.10      # локальный минимум RR для газа (вместо глобального 1.30)
-CONF_MIN_NG       = 0.50      # локальный порог уверенности (вместо 0.70)
-COOLDOWN_SEC_NG   = 8         # короткий кулдаун для газа
-IMPULSE_PIPS_NG   = 0.010     # минимальный микродвиж за бар (в пунктах NG)
-LOOKBACK_BREAK_NG = 6         # окно для мини-пробоя high/low
+RR_MIN_NG         = 1.10
+CONF_MIN_NG       = 0.50
+COOLDOWN_SEC_NG   = 8
+IMPULSE_PIPS_NG   = 0.010
+LOOKBACK_BREAK_NG = 6
 
 # ==== NG strategy pack (Morpher-style) ====
 NG_STRAT_ENABLED        = True
@@ -119,8 +114,8 @@ NG_EIA_BLACKOUT_MIN_BEFORE = 30
 NG_EIA_BLACKOUT_MIN_AFTER  = 30
 NG_EIA_UTC_HOUR         = 14
 NG_EIA_UTC_MIN          = 30
-NG_EIA_WEEKDAY          = 3         # Thursday (Mon=0)
-NG_SEASONAL_MONTHS_BULL = {11,12,1,2,3}  # NOV..MAR
+NG_EIA_WEEKDAY          = 3             # Thursday (Mon=0)
+NG_SEASONAL_MONTHS_BULL = {11,12,1,2,3} # NOV..MAR
 
 # ===================== STATE =====================
 
@@ -134,16 +129,17 @@ cooldown_until = {"BTC": 0, "NG": 0, "XAU": 0}
 last_candle_close_ts = {"BTC": 0, "NG": 0, "XAU": 0}
 boot_ts = time.time()
 
-# state for ideas
-_last_idea_ts = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}     # время последней отправленной идеи
-_ideas_count_hour = {"BTC": 0, "NG": 0, "XAU": 0}       # сколько идей отправлено в текущем часу
-_ideas_count_hour_ts = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}  # начало часа для счётчика
-
+# «обработали ли закрытый бар»
 last_seen_idx   = {"BTC": -1, "NG": -1, "XAU": -1}
 last_signal_idx = {"BTC": -1, "NG": -1, "XAU": -1}
 
-# Анти-лимит Yahoo (когда снова можно пробовать Yahoo)
-YAHOO_BACKOFF_UNTIL = {"NG": 0, "XAU": 0, "BTC": 0}
+# идеи (анти-спам)
+_last_idea_ts = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}
+_ideas_count_hour = {"BTC": 0, "NG": 0, "XAU": 0}
+_ideas_count_hour_ts = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}
+
+# кэш прайсов
+_prices_cache = {}
 
 DEFAULT_PARAMS = {
     "tp_mul": 1.80, "sl_mul": 1.20, "risk": 1.00,
@@ -159,7 +155,8 @@ def load_json(path, default):
 
 def save_json(path, data):
     try:
-        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"save_json({path}) -> {e}")
 
@@ -181,10 +178,8 @@ def append_trade(row):
 # ===================== TECH =====================
 
 def _sigmoid(x: float) -> float:
-    try:
-        return 1.0 / (1.0 + math.exp(-float(x)))
-    except Exception:
-        return 0.5
+    try: return 1.0 / (1.0 + math.exp(-float(x)))
+    except Exception: return 0.5
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
@@ -234,41 +229,9 @@ def sig_id(symbol, side, trend, atr_val, tf):
 
 def allow_after_sl(symbol, signature, ts):
     p = stats.get(symbol, deepcopy(DEFAULT_PARAMS))
-    return not (p.get("last_outcome") == "SL" and p.get("last_sig") == signature and ts - float(p.get("last_sig_ts",0)) < GUARD_AFTER_SL_S)
-
-# ===================== PRICE =====================
-
-async def _http_get_text(session: aiohttp.ClientSession, url: str) -> str:
-    for i in range(HTTP_RETRIES):
-        try:
-            await asyncio.sleep(random.uniform(0.08, 0.20))
-            async with session.get(url, headers=COMMON_HEADERS, timeout=HTTP_TIMEOUT) as r:
-                if r.status == 200:
-                    return await r.text()
-                if r.status in (429, 503):
-                    logging.warning(f"429/503 on GET text: {url}")
-                    await asyncio.sleep(1.0 * (i + 1))
-                    continue
-        except Exception as e:
-            logging.warning(f"GET text fail [{i+1}/{HTTP_RETRIES}] {url}: {e}")
-        await asyncio.sleep(HTTP_RETRY_SLEEP)
-    return {}
-
-async def _http_get_json(session: aiohttp.ClientSession, url: str) -> dict:
-    for i in range(HTTP_RETRIES):
-        try:
-            await asyncio.sleep(random.uniform(0.08, 0.20))
-            async with session.get(url, headers=COMMON_HEADERS, timeout=HTTP_TIMEOUT) as r:
-                if r.status == 200:
-                    return await r.json()
-                if r.status in (429, 503):
-                    logging.warning(f"429/503 on GET json: {url}")
-                    await asyncio.sleep(1.0 * (i + 1))
-                    continue
-        except Exception as e:
-            logging.warning(f"GET json fail [{i+1}/{HTTP_RETRIES}] {url}: {e}")
-        await asyncio.sleep(HTTP_RETRY_SLEEP)
-    return {}
+    return not (p.get("last_outcome") == "SL" and
+                p.get("last_sig") == signature and
+                ts - float(p.get("last_sig_ts",0)) < GUARD_AFTER_SL_S)
 
 # ===================== PRICE (robust NG/XAU) =====================
 
@@ -287,20 +250,7 @@ YAHOO_RETRIES   = 4
 YAHOO_BACKOFF0  = 0.9
 YAHOO_JITTER    = 0.35
 
-_prices_cache = {}
 def _now(): return time.time()
-
-async def _http_get_text(session: aiohttp.ClientSession, url: str) -> str:
-    for i in range(HTTP_RETRIES):
-        try:
-            async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
-                if r.status == 200:
-                    return await r.text()
-                await asyncio.sleep(0.25)
-        except Exception as e:
-            logging.warning(f"GET text fail [{i+1}/{HTTP_RETRIES}] {url}: {e}")
-        await asyncio.sleep(HTTP_RETRY_SLEEP)
-    return ""
 
 async def _http_get_json_robust(session: aiohttp.ClientSession, url: str) -> dict:
     backoff = YAHOO_BACKOFF0
@@ -361,10 +311,9 @@ async def _get_df_ng_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
     data = await _http_get_json_robust(session, url)
     return _df_from_yahoo_v8(data)
 
-# 1) Yahoo для золота — пробуем XAUUSD=X, потом GC=F
 async def _get_df_xau_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
-    tickers = ("XAUUSD%3DX", "GC%3DF")  # spot и фьюч
-    for t in tickers:
+    # пробуем спот и фьюч
+    for t in ("XAUUSD%3DX", "GC%3DF"):
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"
         data = await _http_get_json_robust(session, url)
         df = _df_from_yahoo_v8(data)
@@ -373,38 +322,57 @@ async def _get_df_xau_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
     return pd.DataFrame()
 
 async def _get_df_ng_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
-    txt = await _http_get_text(session, "https://stooq.com/q/d/l/?s=ng.f&i=1")
-    return df_from_stooq_csv(txt)
+    url = "https://stooq.com/q/d/l/?s=ng.f&i=1"
+    try:
+        async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
+            if r.status == 200:
+                txt = await r.text()
+                return df_from_stooq_csv(txt)
+    except Exception as e:
+        logging.warning(f"stooq NG fail: {e}")
+    return pd.DataFrame()
 
-# 2) Stooq для золота — пробуем форекс и фьюч
 async def _get_df_xau_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
-    tickers = ("xauusd", "gc.f")
-    for t in tickers:
-        txt = await _http_get_text(session, f"https://stooq.com/q/d/l/?s={t}&i=1")
-        df = df_from_stooq_csv(txt)
-        if not df.empty:
-            return df
+    # пробуем форексный тикер и фьюч
+    for t in ("xauusd", "gc.f"):
+        url = f"https://stooq.com/q/d/l/?s={t}&i=1"
+        try:
+            async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
+                if r.status == 200:
+                    txt = await r.text()
+                    df = df_from_stooq_csv(txt)
+                    if not df.empty:
+                        return df
+        except Exception as e:
+            logging.warning(f"stooq XAU fail: {e}")
     return pd.DataFrame()
 
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
+    """Единая точка получения цен + кэш."""
     global last_candle_close_ts, _prices_cache
-
+    now_ts = time.time()
     cache_ttl = 12.0 if symbol in ("NG", "XAU") else 2.0
     c = _prices_cache.get(symbol)
-    now_ts = _now()
     if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
 
     if symbol == "BTC":
-        data = await _http_get_json_robust(session, CC_URL)
+        # CryptoCompare (как было, просто под robust-запрос)
         try:
-            if data.get("Response") != "Success":
-                return pd.DataFrame()
+            async with aiohttp.ClientSession() as s2:
+                async with s2.get(CC_URL, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
+                    if r.status != 200:
+                        return pd.DataFrame()
+                    data = await r.json()
+        except Exception as e:
+            logging.warning(f"BTC feed error: {e}")
+            return pd.DataFrame()
+        try:
+            if data.get("Response") != "Success": return pd.DataFrame()
             arr = data["Data"]["Data"]
             df = pd.DataFrame(arr)
             if "time" in df.columns:
-                last_ts = int(df["time"].iloc[-1])
-                last_candle_close_ts["BTC"] = last_ts
+                last_candle_close_ts["BTC"] = int(df["time"].iloc[-1])
             df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"}, inplace=True)
             df = df[["Open","High","Low","Close"]].tail(300).reset_index(drop=True)
             _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"cc"}
@@ -445,8 +413,9 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
     return pd.DataFrame()
 
+# ===================== IDEAS anti-spam =====================
+
 def _reset_hour_if_needed(sym: str):
-    """Сбросить счётчик идей, если прошёл час с _ideas_count_hour_ts."""
     now = time.time()
     start = _ideas_count_hour_ts.get(sym, 0.0) or 0.0
     if now - start >= 3600:
@@ -454,21 +423,16 @@ def _reset_hour_if_needed(sym: str):
         _ideas_count_hour[sym] = 0
 
 def can_send_idea(sym: str) -> bool:
-    """Проверки anti-spam: cooldown и max per hour."""
-    if not SEND_IDEAS:
-        return False
+    if not SEND_IDEAS: return False
     now = time.time()
-    # cooldown
     if now - _last_idea_ts.get(sym, 0.0) < IDEA_COOLDOWN_SEC:
         return False
-    # hourly limit
     _reset_hour_if_needed(sym)
     if _ideas_count_hour.get(sym, 0) >= MAX_IDEAS_PER_HOUR:
         return False
     return True
 
 async def send_idea_message(symbol: str, setup: dict, buffer: float, note: str = ""):
-    """Формат идеи — аналог format_signal, но пометка 'idea' и conf%."""
     sym = setup["symbol"]
     side = setup["side"]
     tf = setup.get("tf", "1m")
@@ -482,15 +446,14 @@ async def send_idea_message(symbol: str, setup: dict, buffer: float, note: str =
         f"Entry: {rnd(sym, setup['entry'])}\n"
         f"TP: {rnd(sym, tp)}  SL: {rnd(sym, sl)}  ATR(14)≈{rnd(sym, setup.get('atr',0))}"
     )
-    try:
-        await bot.send_message(OWNER_ID, text)
-    except:
-        pass
-    # update stats
+    try: await bot.send_message(OWNER_ID, text)
+    except: pass
     _last_idea_ts[symbol] = time.time()
     _ideas_count_hour[symbol] = _ideas_count_hour.get(symbol, 0) + 1
     if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
         _ideas_count_hour_ts[symbol] = time.time()
+
+# ===================== STRATEGY =====================
 
 def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
     try:
@@ -502,38 +465,31 @@ def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
     from_range = float(rng)     * RANGE_K.get(symbol, 1.0)
     return max(base, from_atr, from_range)
 
-# ===================== STRATEGY =====================
-
-# (первая версия _ng_feats тут, вторая ниже — оставляю как есть, не трогаю)
-
 def trend_side(df: pd.DataFrame) -> str:
     c = df["Close"]
     return "UP" if ema(c, EMA_FAST).iloc[-1] > ema(c, EMA_SLOW).iloc[-1] else "DOWN"
 
 def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str, feats: dict | None = None) -> float:
-    rr_part    = max(0.0, min(1.0, (rr - 1.0) / 1.2))
+    rr_part    = max(0.0, min(1.0, (rr - 1.0) / 1.2))   # RR 1.0->0 ; 2.2->1
     trend_part = 0.1 if trend_ok else 0.0
     tiny_atr_penalty = 0.05 if atr_now < (MIN_SPREAD.get(symbol, 0.0) * 0.2) else 0.0
     conf = rr_part + trend_part - tiny_atr_penalty
-
-    # NG бусты — оставляю как у тебя
+    # бусты NG
     if symbol == "NG" and feats:
-        if feats.get("impulse_ok"):                 conf += 0.12
-        if feats.get("broke_up") or feats.get("broke_dn"):  conf += 0.10
+        if feats.get("impulse_ok"): conf += 0.12
+        if feats.get("broke_up") or feats.get("broke_dn"): conf += 0.10
         if (feats.get("ema_up") and trend_ok) or (feats.get("ema_dn") and not trend_ok):
             conf += 0.08
-
     return max(0.0, min(1.0, conf))
 
-def _ng_feats(df: pd.DataFrame) -> dict:
-    """Лёгкий nowcast для NG, возвращает {'p_up': ...}."""
-    feats = {"p_up": 0.5}
+def _ng_nowcast(df: pd.DataFrame) -> dict:
+    """Лёгкий nowcast (p_up) для NG по закрытым барам."""
+    feats = {"p_up": 0.5, "impulse_ok": False, "broke_up": False, "broke_dn": False, "ema_up": False, "ema_dn": False}
     try:
         if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 5:
             return feats
         closed = len(df) - 2
-        if closed < 4:
-            return feats
+        if closed < 4: return feats
 
         c = df["Close"].astype(float).values
         o = df["Open"].astype(float).values if "Open" in df.columns else c
@@ -547,49 +503,59 @@ def _ng_feats(df: pd.DataFrame) -> dict:
         df_tmp = df.copy()
         df_tmp["ATR"] = atr(df_tmp, ATR_PERIOD)
         atr_now = float(df_tmp["ATR"].iloc[closed])
-        if not np.isfinite(atr_now) or atr_now <= 0:
-            return feats
+        if not np.isfinite(atr_now) or atr_now <= 0: return feats
 
+        # импульс
         r1 = c[closed]   - c[closed-1]
         r2 = c[closed-1] - c[closed-2]
         accel = (r1 - r2) / max(atr_now, 1e-12)
 
+        # ema наклоны
         slope_fast = (ema_fast[closed] - ema_fast[closed-2]) / max(atr_now, 1e-12)
         slope_slow = (ema_slow[closed] - ema_slow[closed-2]) / max(atr_now, 1e-12)
         ema_combo = slope_fast + 0.7 * slope_slow
 
+        # расширение волатильности
         atr_ref = float(pd.Series(df_tmp["ATR"]).rolling(20).mean().iloc[closed])
         vol_expand = 0.0
         if np.isfinite(atr_ref) and atr_ref > 0:
             vol_expand = (atr_now / atr_ref) - 1.0
 
+        # предпробой
         N = 12
         window_c = c[closed-N:closed+1]
         prebreak_up   = (c[closed] - window_c.min()) / max(atr_now, 1e-12)
         prebreak_down = (window_c.max() - c[closed]) / max(atr_now, 1e-12)
         prebreak = prebreak_up - prebreak_down
 
+        # свечная «тяжесть»
         body = abs(c[closed-1] - o[closed-1])
         rng  = max(h[closed-1] - l[closed-1], 1e-12)
         upper = h[closed-1] - max(c[closed-1], o[closed-1])
         lower = min(c[closed-1], o[closed-1]) - l[closed-1]
         candle_bias = ((lower - upper) / rng) + ((c[closed-1] - l[closed-1]) / rng - 0.5)
 
+        # простые булеаны (для бустов/логов)
+        feats["impulse_ok"] = abs(c[closed] - c[closed-1]) >= IMPULSE_PIPS_NG
+        Nbr = LOOKBACK_BREAK_NG
+        hi = float(np.max(h[closed-(Nbr+1):closed-1])) if closed-(Nbr+1) >= 0 else np.nan
+        lo = float(np.min(l[closed-(Nbr+1):closed-1])) if closed-(Nbr+1) >= 0 else np.nan
+        feats["broke_up"] = np.isfinite(hi) and (c[closed] > hi)
+        feats["broke_dn"] = np.isfinite(lo) and (c[closed] < lo)
+        feats["ema_up"]   = bool(ema_fast[closed] > ema_slow[closed])
+        feats["ema_dn"]   = bool(ema_fast[closed] < ema_slow[closed])
+
+        # скор -> вероятность
         w1, w2, w3, w4, w5 = 2.4, 2.0, 1.8, 1.2, 0.8
-        score = (
-            w1 * accel +
-            w2 * ema_combo +
-            w3 * prebreak +
-            w4 * vol_expand +
-            w5 * candle_bias
-        )
-        p_up = _sigmoid(score)
-        feats["p_up"] = _clip01(p_up)
-
+        score = (w1 * ( (r1 - r2) / max(atr_now, 1e-12) ) +
+                 w2 * ema_combo +
+                 w3 * prebreak +
+                 w4 * vol_expand +
+                 w5 * candle_bias)
+        feats["p_up"] = _clip01(_sigmoid(score))
+        return feats
     except Exception:
-        pass
-
-    return feats
+        return feats
 
 def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
@@ -601,21 +567,22 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if not np.isfinite(atr_now) or atr_now <= 0:
         return None
 
-    # >>> NG: порог по ATR
+    # ATR-порог для NG
     if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
         return None
 
-    side_tr = trend_side(df)
-    last = df.iloc[-2]
-    entry = float(last["Close"])
+    side_tr = trend_side(df)     # тренд по EMA (на текущем баре)
+    last    = df.iloc[-2]        # закрытый бар
+    entry   = float(last["Close"])
 
-    feats = None
-    if symbol == "NG":
-        feats = _ng_feats(df)
+    # NG nowcast/feats
+    feats = _ng_nowcast(df) if symbol == "NG" else None
 
+    # локальные пороги
     rr_min   = RR_MIN_NG   if symbol == "NG" else RR_MIN
     conf_min = CONF_MIN_NG if symbol == "NG" else CONF_MIN
 
+    # динамические TP/SL через ATR (как было)
     p = stats.get(symbol, deepcopy(DEFAULT_PARAMS))
     tp_mul = float(p["tp_mul"]) * float(p["risk"])
     sl_mul = float(p["sl_mul"]) * float(1.0 / p["risk"])
@@ -639,32 +606,26 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if rr < rr_min:
         return None
 
-    # >>> NG: бонус к уверенности от nowcast  (ВНУТРИ ФУНКЦИИ!)
+    # бонус к уверенности от nowcast (NG)
+    nowcast_extra = 0.0
     if symbol == "NG" and feats:
         p_up = float(feats.get("p_up", 0.5))
         if side == "BUY" and p_up >= 0.58:
-            extra = 0.10
-            extra += 0.05 if p_up >= 0.66 else 0.0
-            nowcast_extra = extra
+            nowcast_extra = 0.10 + (0.05 if p_up >= 0.66 else 0.0)
         elif side == "SELL" and p_up <= 0.42:
-            extra = 0.10
-            extra += 0.05 if p_up <= 0.34 else 0.0
-            nowcast_extra = extra
-        else:
-            nowcast_extra = 0.0
-    else:
-        nowcast_extra = 0.0
+            nowcast_extra = 0.10 + (0.05 if p_up <= 0.34 else 0.0)
 
-    # уверенность
-    conf = _confidence(rr, True, atr_now, symbol, feats)
-    if conf < conf_min:
+    conf_base = _confidence(rr, True, atr_now, symbol, feats)
+    if conf_base < conf_min and conf_base + nowcast_extra < conf_min:
+        # слишком слабо даже с бустом — вернём None
         return None
-    conf = max(0.0, min(1.0, conf + nowcast_extra))
+
+    conf = max(0.0, min(1.0, conf_base + nowcast_extra))
 
     signature = sig_id(symbol, side, side_tr, atr_now, tf_label)
     return {
         "symbol": symbol, "tf": tf_label,
-        "side": side_tr, "trend": side_tr,
+        "side": side, "trend": side_tr,
         "entry": entry, "tp": tp, "sl": sl,
         "atr": atr_now, "rr": rr, "conf": conf, "sig": signature,
     }
@@ -706,9 +667,7 @@ def learn(symbol: str, outcome: str, sess: dict):
 def finish_trade(symbol: str, outcome: str, price_now: float):
     sess = trade[symbol]
     trade[symbol] = None
-    cooldown_until[symbol] = time.time() + COOLDOWN_SEC
-    if symbol == "NG":
-        cooldown_until[symbol] = time.time() + COOLDOWN_SEC_NG
+    cooldown_until[symbol] = time.time() + (COOLDOWN_SEC_NG if symbol == "NG" else COOLDOWN_SEC)
     if not sess: return
     try:
         rr = (sess["tp"]-sess["entry"]) if sess["side"]=="BUY" else (sess["entry"]-sess["tp"])
@@ -814,38 +773,26 @@ async def cmd_test(m: Message):
 # ===================== NOTIFY =====================
 
 async def send_signal(symbol: str, setup: dict, buffer: float):
-    try:
-        await bot.send_message(OWNER_ID, format_signal(setup, buffer))
-    except Exception:
-        pass
+    try: await bot.send_message(OWNER_ID, format_signal(setup, buffer))
+    except: pass
 
 async def send_text(txt: str):
-    try:
-        await bot.send_message(OWNER_ID, txt)
-    except Exception:
-        pass
+    try: await bot.send_message(OWNER_ID, txt)
+    except: pass
 
 async def notify_hit(symbol: str, outcome: str, price: float):
-    name = SYMBOLS[symbol]["name"]
-    p = rnd(symbol, price)
-    text = f"✅ TP hit on {name} @ {p}" if outcome == "TP" else f"🟥 SL hit on {name} @ {p}"
-    try:
-        await bot.send_message(OWNER_ID, text)
-    except Exception:
-        pass
-
+    name = SYMBOLS[symbol]["name"]; p = rnd(symbol, price)
+    text = f"✅ TP hit on {name} @ {p}" if outcome=="TP" else f"🟥 SL hit on {name} @ {p}"
+    try: await bot.send_message(OWNER_ID, text)
+    except: pass
 
 # ===================== ENGINE =====================
 
 def _active_symbols_for_mode(md: str):
-    if md == "AUTO":
-        return ["NG", "XAU"]
-    if md == "BTC":
-        return ["BTC"]
-    if md == "NG":
-        return ["NG"]
-    if md == "XAU":
-        return ["XAU"]
+    if md == "AUTO": return ["NG","XAU"]
+    if md == "BTC":  return ["BTC"]
+    if md == "NG":   return ["NG"]
+    if md == "XAU":  return ["XAU"]
     return ["BTC"]
 
 def _apply_mode_change_if_needed():
@@ -860,11 +807,8 @@ def _apply_mode_change_if_needed():
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     global last_candle_close_ts, last_seen_idx, last_signal_idx
 
-    # фильтр по режиму
-    if mode != "AUTO" and mode != symbol:
-        return
+    if mode != "AUTO" and mode != symbol: return
 
-    # цены
     df = await get_df(session, symbol)
     if df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
         return
@@ -873,104 +817,86 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     last_candle_close_ts[symbol] = time.time()
     atr_now = float(atr(df, ATR_PERIOD).iloc[-1])
     val = rnd(symbol, atr_now)
-
     if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
         state[f"atr_{symbol}"] = f"{val} (low)"
     else:
         state[f"atr_{symbol}"] = val
 
-    logging.info(
-        f"HB {symbol}: last_close={rnd(symbol, float(df['Close'].iloc[-1]))} "
-        f"ATR≈{rnd(symbol, atr_now)}"
-    )
+    logging.info(f"HB {symbol}: last_close={rnd(symbol, float(df['Close'].iloc[-1]))} ATR≈{rnd(symbol, atr_now)}")
 
-    # работа только на новом закрытом баре
+    # только новый закрытый бар
     cur_idx = len(df) - 1
     closed_idx = cur_idx - 1
     if closed_idx <= last_seen_idx[symbol]:
         return
     last_seen_idx[symbol] = closed_idx
 
-    # сопровождение открытой «сессии»
+    # сопровождение открытой сессии
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))
         post = df.iloc[(start_i + 1):]
         if not post.empty:
-            side = sess["side"]
-            tp = sess["tp"]
-            sl = sess["sl"]
+            side = sess["side"]; tp = sess["tp"]; sl = sess["sl"]
             if side == "BUY":
                 hit_tp = post["High"].max() >= tp
-                hit_sl = post["Low"].min() <= sl
+                hit_sl = post["Low"].min()  <= sl
             else:
-                hit_tp = post["Low"].min() <= tp
+                hit_tp = post["Low"].min()  <= tp
                 hit_sl = post["High"].max() >= sl
-
             if hit_tp:
                 price_now = float(post["Close"].iloc[-1])
                 await notify_hit(symbol, "TP", price_now)
                 finish_trade(symbol, "TP", price_now)
                 return
-
             if hit_sl:
                 price_now = float(post["Close"].iloc[-1])
                 await notify_hit(symbol, "SL", price_now)
                 finish_trade(symbol, "SL", price_now)
                 return
-
-        return  # есть активная сделка — новых входов не ищем
+        return  # активная сделка — новых входов не ищем
 
     # глобальные блокировки
-    if time.time() - boot_ts < BOOT_COOLDOWN_S:
-        return
-    if time.time() < cooldown_until[symbol]:
-        return
+    if time.time() - boot_ts < BOOT_COOLDOWN_S: return
+    if time.time() < cooldown_until[symbol]: return
 
     # построение сетапа
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"])
-    if not setup:
-        return
+    if not setup: return
 
-    # защита от повторов на тот же закрытый бар
+    # защита от повторов в том же закрытом баре
     if last_signal_idx[symbol] == closed_idx:
         return
     last_signal_idx[symbol] = closed_idx
 
-    # уверенность/идея/сделка
-    conf = float(setup.get("conf", 0.0))
-    pct = int(round(conf * 100))
-
-    # буфер и уровни (для текста и для входа)
+    # буфер и уровни (для показа и для входа)
     base_buffer = dynamic_buffer(symbol, df, setup["atr"])
     add = BUF_K_TO_LEVEL.get(symbol, 1.0) * base_buffer
     side = setup["side"]
     tp_show = setup["tp"] + (add if side == "BUY" else -add)
     sl_show = setup["sl"] - (add if side == "BUY" else -add)
 
-    # отправляем «идею», если достигли порога идеи
-    if conf >= CONF_MIN_IDEA:
-        name = SYMBOLS[symbol]["name"]
-        entry = rnd(symbol, setup["entry"])
-        atr_v = rnd(symbol, setup["atr"])
-        rr_v = round(float(setup.get("rr", setup.get("rr_base", 0.0))), 2)
-        prefix = "⚡️ СДЕЛКА" if conf >= CONF_MIN_TRADE else "💡 ИДЕЯ"
+    # уверенность
+    conf = float(setup.get("conf", 0.0))
+    pct  = int(round(conf * 100))
+    rr_v = round(float(setup.get("rr", 0.0)), 2)
+    entry = rnd(symbol, setup["entry"])
+    atr_v = rnd(symbol, setup["atr"])
+    name = SYMBOLS[symbol]["name"]
 
+    # шлём «идею», если дозволено
+    if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
         txt = (
-            f"{prefix} {name} | {SYMBOLS[symbol]['tf']}\n"
+            f"{'⚡️ СДЕЛКА' if conf >= CONF_MIN_TRADE else '💡 ИДЕЯ'} {name} | {SYMBOLS[symbol]['tf']}\n"
             f"{side} | Conf: {pct}%  RR≈{rr_v}  ATR≈{atr_v}\n"
             f"Entry: {entry}\n"
             f"TP: {rnd(symbol, tp_show)}   SL: {rnd(symbol, sl_show)}"
         )
         await send_text(txt)
 
-    # открываем «боевую» сделку только при торговом пороге
+    # открываем «боевую» только при торговом пороге
     if conf >= CONF_MIN_TRADE:
-        # анти-реэнтри после SL этой же «подписи»
-        if not allow_after_sl(symbol, setup["sig"], time.time()):
-            return
-
-        # шлём полноценный сигнал и открываем сессию
+        if not allow_after_sl(symbol, setup["sig"], time.time()): return
         await send_signal(symbol, setup, base_buffer)
         trade[symbol] = {
             "side": setup["side"],
@@ -981,9 +907,6 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
             "opened_at": time.time(),
             "entry_bar_idx": cur_idx,
         }
-
-    return  # явное завершение обработчика
-
 
 async def engine_loop():
     async with aiohttp.ClientSession() as session:
@@ -997,13 +920,13 @@ async def engine_loop():
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(2)
 
-
 # ===================== MAIN =====================
 
+router = Router()  # (повтор тут безобиден, но выше уже подключен)
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     global mode, requested_mode, last_mode_switch_ts
-    mode = state.get("mode", "BTC")
+    mode = state.get("mode","BTC")
     requested_mode = mode
     last_mode_switch_ts = time.time()
     asyncio.create_task(engine_loop())
@@ -1014,4 +937,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-

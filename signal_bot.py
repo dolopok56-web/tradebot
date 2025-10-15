@@ -43,8 +43,8 @@ RR_MIN     = 1.30
 MAX_SL_ATR = 1.40
 
 # ---------- Idea / trade thresholds ----------
-CONF_MIN_IDEA    = 0.20   # >= этого — шлём идею (но не открываем сделку)
-CONF_MIN_TRADE   = 0.58   # >= этого — "боевой" сигнал (открываем сделку)
+CONF_MIN_IDEA    = 0.15   # >= этого — шлём идею (но не открываем сделку)
+CONF_MIN_TRADE   = 0.50   # >= этого — "боевой" сигнал (открываем сделку)
 
 # Idea anti-spam
 SEND_IDEAS       = True
@@ -817,6 +817,12 @@ async def send_signal(symbol: str, setup: dict, buffer: float):
     try: await bot.send_message(OWNER_ID, format_signal(setup, buffer))
     except: pass
 
+async def send_text(txt: str):
+    try:
+        await bot.send_message(OWNER_ID, txt)
+    except Exception:
+        pass
+
 async def notify_hit(symbol: str, outcome: str, price: float):
     name = SYMBOLS[symbol]["name"]; p = rnd(symbol, price)
     text = f"✅ TP hit on {name} @ {p}" if outcome=="TP" else f"🟥 SL hit on {name} @ {p}"
@@ -896,7 +902,21 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     if time.time() < cooldown_until[symbol]: return
 
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"])
-    if not setup: return
+if not setup:
+    return
+
+# если это ИДЕЯ (conf между CONF_MIN_IDEA и CONF_MIN_TRADE) — шлём текст и выходим
+conf = float(setup.get("conf", 0.0))
+if CONF_MIN_IDEA <= conf < CONF_MIN_TRADE:
+    txt = (
+        f"💡 ИДЕЯ {symbol} | {setup['tf']}\n"
+        f"Conf: {int(conf*100)}%  RR≈{round(setup.get('rr', 1.0), 2)}\n"
+        f"Entry: {rnd(symbol, setup['entry'])}  ATR≈{rnd(symbol, setup['atr'])}\n"
+        f"Trend: {setup.get('trend','?')}"
+    )
+    await send_text(txt)   # <<< ВНУТРИ async-функции
+    last_signal_idx[symbol] = closed_idx  # чтобы не спамить идеей на каждом баре
+    return
 
     if last_signal_idx[symbol] == closed_idx:
         return
@@ -981,4 +1001,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

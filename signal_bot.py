@@ -39,7 +39,7 @@ RANGE_K = {"BTC": 0.90, "NG": 0.75, "XAU": 0.90}
 BUF_K_TO_LEVEL = {"BTC": 1.15, "NG": 0.20, "XAU": 0.30}
 
 # Минимальный RR и ограничение ширины стопа
-RR_MIN     = 1.30
+RR_MIN     = 1.10
 MAX_SL_ATR = 1.40
 
 # ---------- Idea / trade thresholds ----------
@@ -52,7 +52,7 @@ IDEA_COOLDOWN_SEC = 120   # минимум секунд между идеями 
 MAX_IDEAS_PER_HOUR = 10   # лимит идей в час по символу
 
 # Порог допуска по «уверенности»
-CONF_MIN = 0.70
+CONF_MIN = 0.55
 
 SYMBOLS = {
     "BTC": {"name": "BTC-USD",   "tf": "1m"},
@@ -61,13 +61,13 @@ SYMBOLS = {
 }
 
 # Периоды
-ATR_PERIOD = 14
-EMA_FAST   = 12
-EMA_SLOW   = 26
+ATR_PERIOD = 10
+EMA_FAST   = 9
+EMA_SLOW   = 21
 
 # Тик-цикл
 POLL_SEC         = 5
-COOLDOWN_SEC     = 20
+COOLDOWN_SEC     = 12
 GUARD_AFTER_SL_S = 15 * 60
 BOOT_COOLDOWN_S  = 60
 
@@ -100,7 +100,7 @@ STOOQ_TPL  = "https://stooq.com/q/d/l/?s={ticker}&i=1"
 
 # ---- Локальные пороги только для NATGAS (NG) ----
 RR_MIN_NG         = 1.10      # локальный минимум RR для газа (вместо глобального 1.30)
-CONF_MIN_NG       = 0.55      # локальный порог уверенности (вместо 0.70)
+CONF_MIN_NG       = 0.50      # локальный порог уверенности (вместо 0.70)
 COOLDOWN_SEC_NG   = 8         # короткий кулдаун для газа
 IMPULSE_PIPS_NG   = 0.010     # минимальный микродвиж за бар (в пунктах NG)
 LOOKBACK_BREAK_NG = 6         # окно для мини-пробоя high/low
@@ -1014,3 +1014,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

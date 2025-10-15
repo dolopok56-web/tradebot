@@ -814,8 +814,10 @@ async def cmd_test(m: Message):
 # ===================== NOTIFY =====================
 
 async def send_signal(symbol: str, setup: dict, buffer: float):
-    try: await bot.send_message(OWNER_ID, format_signal(setup, buffer))
-    except: pass
+    try:
+        await bot.send_message(OWNER_ID, format_signal(setup, buffer))
+    except Exception:
+        pass
 
 async def send_text(txt: str):
     try:
@@ -824,18 +826,26 @@ async def send_text(txt: str):
         pass
 
 async def notify_hit(symbol: str, outcome: str, price: float):
-    name = SYMBOLS[symbol]["name"]; p = rnd(symbol, price)
-    text = f"✅ TP hit on {name} @ {p}" if outcome=="TP" else f"🟥 SL hit on {name} @ {p}"
-    try: await bot.send_message(OWNER_ID, text)
-    except: pass
+    name = SYMBOLS[symbol]["name"]
+    p = rnd(symbol, price)
+    text = f"✅ TP hit on {name} @ {p}" if outcome == "TP" else f"🟥 SL hit on {name} @ {p}"
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except Exception:
+        pass
+
 
 # ===================== ENGINE =====================
 
 def _active_symbols_for_mode(md: str):
-    if md == "AUTO": return ["NG","XAU"]
-    if md == "BTC":  return ["BTC"]
-    if md == "NG":   return ["NG"]
-    if md == "XAU":  return ["XAU"]
+    if md == "AUTO":
+        return ["NG", "XAU"]
+    if md == "BTC":
+        return ["BTC"]
+    if md == "NG":
+        return ["NG"]
+    if md == "XAU":
+        return ["XAU"]
     return ["BTC"]
 
 def _apply_mode_change_if_needed():
@@ -850,127 +860,129 @@ def _apply_mode_change_if_needed():
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     global last_candle_close_ts, last_seen_idx, last_signal_idx
 
-    if mode != "AUTO" and mode != symbol: return
+    # фильтр по режиму
+    if mode != "AUTO" and mode != symbol:
+        return
 
+    # цены
     df = await get_df(session, symbol)
     if df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
         return
 
+    # хартбит + ATR в статус
     last_candle_close_ts[symbol] = time.time()
     atr_now = float(atr(df, ATR_PERIOD).iloc[-1])
     val = rnd(symbol, atr_now)
 
-    # >>> NG: пометка если ATR ниже минимального порога
     if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
         state[f"atr_{symbol}"] = f"{val} (low)"
     else:
         state[f"atr_{symbol}"] = val
 
-    logging.info(f"HB {symbol}: last_close={rnd(symbol, float(df['Close'].iloc[-1]))} ATR≈{rnd(symbol, atr_now)}")
+    logging.info(
+        f"HB {symbol}: last_close={rnd(symbol, float(df['Close'].iloc[-1]))} "
+        f"ATR≈{rnd(symbol, atr_now)}"
+    )
 
+    # работа только на новом закрытом баре
     cur_idx = len(df) - 1
     closed_idx = cur_idx - 1
     if closed_idx <= last_seen_idx[symbol]:
         return
     last_seen_idx[symbol] = closed_idx
 
+    # сопровождение открытой «сессии»
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))
         post = df.iloc[(start_i + 1):]
         if not post.empty:
-            side = sess["side"]; tp = sess["tp"]; sl = sess["sl"]
+            side = sess["side"]
+            tp = sess["tp"]
+            sl = sess["sl"]
             if side == "BUY":
                 hit_tp = post["High"].max() >= tp
-                hit_sl = post["Low"].min()  <= sl
+                hit_sl = post["Low"].min() <= sl
             else:
-                hit_tp = post["Low"].min()  <= tp
+                hit_tp = post["Low"].min() <= tp
                 hit_sl = post["High"].max() >= sl
+
             if hit_tp:
                 price_now = float(post["Close"].iloc[-1])
                 await notify_hit(symbol, "TP", price_now)
                 finish_trade(symbol, "TP", price_now)
                 return
+
             if hit_sl:
                 price_now = float(post["Close"].iloc[-1])
                 await notify_hit(symbol, "SL", price_now)
                 finish_trade(symbol, "SL", price_now)
                 return
+
+        return  # есть активная сделка — новых входов не ищем
+
+    # глобальные блокировки
+    if time.time() - boot_ts < BOOT_COOLDOWN_S:
+        return
+    if time.time() < cooldown_until[symbol]:
         return
 
-    if time.time() - boot_ts < BOOT_COOLDOWN_S: return
-    if time.time() < cooldown_until[symbol]: return
-
+    # построение сетапа
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"])
-if not setup:
-    return
+    if not setup:
+        return
 
-# если это ИДЕЯ (conf между CONF_MIN_IDEA и CONF_MIN_TRADE) — шлём текст и выходим
-conf = float(setup.get("conf", 0.0))
-if CONF_MIN_IDEA <= conf < CONF_MIN_TRADE:
-    txt = (
-        f"💡 ИДЕЯ {symbol} | {setup['tf']}\n"
-        f"Conf: {int(conf*100)}%  RR≈{round(setup.get('rr', 1.0), 2)}\n"
-        f"Entry: {rnd(symbol, setup['entry'])}  ATR≈{rnd(symbol, setup['atr'])}\n"
-        f"Trend: {setup.get('trend','?')}"
-    )
-    await send_text(txt)   # <<< ВНУТРИ async-функции
-    last_signal_idx[symbol] = closed_idx  # чтобы не спамить идеей на каждом баре
-    return
-
+    # защита от повторов на тот же закрытый бар
     if last_signal_idx[symbol] == closed_idx:
         return
     last_signal_idx[symbol] = closed_idx
 
-    if not allow_after_sl(symbol, setup["sig"], time.time()): return
+    # уверенность/идея/сделка
+    conf = float(setup.get("conf", 0.0))
+    pct = int(round(conf * 100))
 
+    # буфер и уровни (для текста и для входа)
     base_buffer = dynamic_buffer(symbol, df, setup["atr"])
     add = BUF_K_TO_LEVEL.get(symbol, 1.0) * base_buffer
     side = setup["side"]
-    tp = setup["tp"] + (add if side=="BUY" else -add)
-    sl = setup["sl"] - (add if side=="BUY" else -add)
+    tp_show = setup["tp"] + (add if side == "BUY" else -add)
+    sl_show = setup["sl"] - (add if side == "BUY" else -add)
 
-    # === Новый блок: идея vs сделка + процент уверенности ===
-conf = float(setup.get("conf", 0.0))
-pct  = int(round(conf * 100))
-
-# если набрали минимум для идеи — отправим «идею»
-if conf >= CONF_MIN_IDEA:
-    try:
+    # отправляем «идею», если достигли порога идеи
+    if conf >= CONF_MIN_IDEA:
         name = SYMBOLS[symbol]["name"]
-        side = setup["side"]
-        trend = setup["trend"]
         entry = rnd(symbol, setup["entry"])
         atr_v = rnd(symbol, setup["atr"])
-        rr_v  = round(float(setup.get("rr", setup.get("rr_base", 0.0))), 2)
-
+        rr_v = round(float(setup.get("rr", setup.get("rr_base", 0.0))), 2)
         prefix = "⚡️ СДЕЛКА" if conf >= CONF_MIN_TRADE else "💡 ИДЕЯ"
+
         txt = (
             f"{prefix} {name} | {SYMBOLS[symbol]['tf']}\n"
-            f"{'BUY' if side=='BUY' else 'SELL'} | Conf: {pct}%  RR≈{rr_v}  ATR≈{atr_v}\n"
-            f"Entry: {entry}"
+            f"{side} | Conf: {pct}%  RR≈{rr_v}  ATR≈{atr_v}\n"
+            f"Entry: {entry}\n"
+            f"TP: {rnd(symbol, tp_show)}   SL: {rnd(symbol, sl_show)}"
         )
-        # Дополнительно уровень TP/SL с подушкой
-        add = BUF_K_TO_LEVEL.get(symbol, 1.0) * base_buffer
-        tp_show = setup['tp'] + (add if side == 'BUY' else -add)
-        sl_show = setup['sl'] - (add if side == 'BUY' else -add)
-        txt += f"\nTP: {rnd(symbol, tp_show)}   SL: {rnd(symbol, sl_show)}"
+        await send_text(txt)
 
-        await bot.send_message(OWNER_ID, txt)
-    except:
-        pass
+    # открываем «боевую» сделку только при торговом пороге
+    if conf >= CONF_MIN_TRADE:
+        # анти-реэнтри после SL этой же «подписи»
+        if not allow_after_sl(symbol, setup["sig"], time.time()):
+            return
 
-# открываем сделку ТОЛЬКО если выше «боевого» порога
-if conf >= CONF_MIN_TRADE:
-    trade[symbol] = {
-        "side": setup["side"],
-        "entry": float(setup["entry"]),
-        "tp": float(tp),
-        "sl": float(sl),
-        "sig": setup["sig"],
-        "opened_at": time.time(),
-        "entry_bar_idx": cur_idx
-    }
+        # шлём полноценный сигнал и открываем сессию
+        await send_signal(symbol, setup, base_buffer)
+        trade[symbol] = {
+            "side": setup["side"],
+            "entry": float(setup["entry"]),
+            "tp": float(tp_show),
+            "sl": float(sl_show),
+            "sig": setup["sig"],
+            "opened_at": time.time(),
+            "entry_bar_idx": cur_idx,
+        }
+
+    return  # явное завершение обработчика
 
 
 async def engine_loop():
@@ -985,12 +997,13 @@ async def engine_loop():
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(2)
 
+
 # ===================== MAIN =====================
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     global mode, requested_mode, last_mode_switch_ts
-    mode = state.get("mode","BTC")
+    mode = state.get("mode", "BTC")
     requested_mode = mode
     last_mode_switch_ts = time.time()
     asyncio.create_task(engine_loop())
@@ -1001,5 +1014,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-
-

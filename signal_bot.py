@@ -29,7 +29,7 @@ STRUCT_BARS    = 1
 MIN_SPREAD = {"BTC": 277.5, "NG": 0.0030, "XAU": 0.25}
 
 # Минимально допустимый ATR для входов (локально по инструментам)
-ATR_MIN = {"BTC": 0.0, "NG": 0.025, "XAU": 0.0}   # NG => 0.025 (25 "пипсов")
+ATR_MIN = {"BTC": 0.0, "NG": 0.010, "XAU": 0.0}   # NG => 0.025 (25 "пипсов")
 
 # Динамика буфера
 ATR_K   = {"BTC": 7.0, "NG": 0.30, "XAU": 0.55}
@@ -41,6 +41,15 @@ BUF_K_TO_LEVEL = {"BTC": 1.15, "NG": 0.20, "XAU": 0.30}
 # Минимальный RR и ограничение ширины стопа
 RR_MIN     = 1.30
 MAX_SL_ATR = 1.40
+
+# ---------- Idea / trade thresholds ----------
+CONF_MIN_IDEA    = 0.20   # >= этого — шлём идею (но не открываем сделку)
+CONF_MIN_TRADE   = 0.58   # >= этого — "боевой" сигнал (открываем сделку)
+
+# Idea anti-spam
+SEND_IDEAS       = True
+IDEA_COOLDOWN_SEC = 120   # минимум секунд между идеями по одному инструменту
+MAX_IDEAS_PER_HOUR = 10   # лимит идей в час по символу
 
 # Порог допуска по «уверенности»
 CONF_MIN = 0.70
@@ -124,6 +133,11 @@ trade = {"BTC": None, "NG": None, "XAU": None}
 cooldown_until = {"BTC": 0, "NG": 0, "XAU": 0}
 last_candle_close_ts = {"BTC": 0, "NG": 0, "XAU": 0}
 boot_ts = time.time()
+
+# state for ideas
+_last_idea_ts = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}     # время последней отправленной идеи
+_ideas_count_hour = {"BTC": 0, "NG": 0, "XAU": 0}       # сколько идей отправлено в текущем часу
+_ideas_count_hour_ts = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}  # начало часа для счётчика
 
 last_seen_idx   = {"BTC": -1, "NG": -1, "XAU": -1}
 last_signal_idx = {"BTC": -1, "NG": -1, "XAU": -1}
@@ -347,18 +361,30 @@ async def _get_df_ng_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
     data = await _http_get_json_robust(session, url)
     return _df_from_yahoo_v8(data)
 
+# 1) Yahoo для золота — пробуем XAUUSD=X, потом GC=F
 async def _get_df_xau_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?interval=1m&range=1d"
-    data = await _http_get_json_robust(session, url)
-    return _df_from_yahoo_v8(data)
+    tickers = ("XAUUSD%3DX", "GC%3DF")  # spot и фьюч
+    for t in tickers:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"
+        data = await _http_get_json_robust(session, url)
+        df = _df_from_yahoo_v8(data)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
 
 async def _get_df_ng_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
     txt = await _http_get_text(session, "https://stooq.com/q/d/l/?s=ng.f&i=1")
     return df_from_stooq_csv(txt)
 
+# 2) Stooq для золота — пробуем форекс и фьюч
 async def _get_df_xau_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
-    txt = await _http_get_text(session, "https://stooq.com/q/d/l/?s=xauusd&i=1")
-    return df_from_stooq_csv(txt)
+    tickers = ("xauusd", "gc.f")
+    for t in tickers:
+        txt = await _http_get_text(session, f"https://stooq.com/q/d/l/?s={t}&i=1")
+        df = df_from_stooq_csv(txt)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
 
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     global last_candle_close_ts, _prices_cache
@@ -418,6 +444,53 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     return pd.DataFrame()
+
+def _reset_hour_if_needed(sym: str):
+    """Сбросить счётчик идей, если прошёл час с _ideas_count_hour_ts."""
+    now = time.time()
+    start = _ideas_count_hour_ts.get(sym, 0.0) or 0.0
+    if now - start >= 3600:
+        _ideas_count_hour_ts[sym] = now
+        _ideas_count_hour[sym] = 0
+
+def can_send_idea(sym: str) -> bool:
+    """Проверки anti-spam: cooldown и max per hour."""
+    if not SEND_IDEAS:
+        return False
+    now = time.time()
+    # cooldown
+    if now - _last_idea_ts.get(sym, 0.0) < IDEA_COOLDOWN_SEC:
+        return False
+    # hourly limit
+    _reset_hour_if_needed(sym)
+    if _ideas_count_hour.get(sym, 0) >= MAX_IDEAS_PER_HOUR:
+        return False
+    return True
+
+async def send_idea_message(symbol: str, setup: dict, buffer: float, note: str = ""):
+    """Формат идеи — аналог format_signal, но пометка 'idea' и conf%."""
+    sym = setup["symbol"]
+    side = setup["side"]
+    tf = setup.get("tf", "1m")
+    add = BUF_K_TO_LEVEL.get(sym, 1.0) * buffer
+    tp = setup["tp"] + (add if side == "BUY" else -add)
+    sl = setup["sl"] - (add if side == "BUY" else -add)
+    conf = int(setup.get("conf", 0.0) * 100)
+    text = (
+        f"💡 IDEA {sym} | {tf}\n"
+        f"{'BUY' if side=='BUY' else 'SELL'}  Conf: {conf}%  {note}\n"
+        f"Entry: {rnd(sym, setup['entry'])}\n"
+        f"TP: {rnd(sym, tp)}  SL: {rnd(sym, sl)}  ATR(14)≈{rnd(sym, setup.get('atr',0))}"
+    )
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except:
+        pass
+    # update stats
+    _last_idea_ts[symbol] = time.time()
+    _ideas_count_hour[symbol] = _ideas_count_hour.get(symbol, 0) + 1
+    if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
+        _ideas_count_hour_ts[symbol] = time.time()
 
 def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
     try:
@@ -837,9 +910,40 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     tp = setup["tp"] + (add if side=="BUY" else -add)
     sl = setup["sl"] - (add if side=="BUY" else -add)
 
-    await send_signal(symbol, setup, base_buffer)
+    # === Новый блок: идея vs сделка + процент уверенности ===
+conf = float(setup.get("conf", 0.0))
+pct  = int(round(conf * 100))
+
+# если набрали минимум для идеи — отправим «идею»
+if conf >= CONF_MIN_IDEA:
+    try:
+        name = SYMBOLS[symbol]["name"]
+        side = setup["side"]
+        trend = setup["trend"]
+        entry = rnd(symbol, setup["entry"])
+        atr_v = rnd(symbol, setup["atr"])
+        rr_v  = round(float(setup.get("rr", setup.get("rr_base", 0.0))), 2)
+
+        prefix = "⚡️ СДЕЛКА" if conf >= CONF_MIN_TRADE else "💡 ИДЕЯ"
+        txt = (
+            f"{prefix} {name} | {SYMBOLS[symbol]['tf']}\n"
+            f"{'BUY' if side=='BUY' else 'SELL'} | Conf: {pct}%  RR≈{rr_v}  ATR≈{atr_v}\n"
+            f"Entry: {entry}"
+        )
+        # Дополнительно уровень TP/SL с подушкой
+        add = BUF_K_TO_LEVEL.get(symbol, 1.0) * base_buffer
+        tp_show = setup['tp'] + (add if side == 'BUY' else -add)
+        sl_show = setup['sl'] - (add if side == 'BUY' else -add)
+        txt += f"\nTP: {rnd(symbol, tp_show)}   SL: {rnd(symbol, sl_show)}"
+
+        await bot.send_message(OWNER_ID, txt)
+    except:
+        pass
+
+# открываем сделку ТОЛЬКО если выше «боевого» порога
+if conf >= CONF_MIN_TRADE:
     trade[symbol] = {
-        "side": side,
+        "side": setup["side"],
         "entry": float(setup["entry"]),
         "tp": float(tp),
         "sl": float(sl),
@@ -847,6 +951,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         "opened_at": time.time(),
         "entry_bar_idx": cur_idx
     }
+
 
 async def engine_loop():
     async with aiohttp.ClientSession() as session:
@@ -876,3 +981,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

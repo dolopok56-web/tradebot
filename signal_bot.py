@@ -17,7 +17,7 @@ from aiogram.filters import Command
 
 # ===================== CONFIG =====================
 
-VERSION = "v14.2 stable (ideas+signals, robust feeds)"
+VERSION = "v15.0 SMC MTF (ideas+signals, robust feeds)"
 
 BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
 OWNER_ID  = 6784470762
@@ -29,8 +29,8 @@ STRUCT_BARS    = 1
 # Минимальные буферы (порог шума)
 MIN_SPREAD = {"BTC": 277.5, "NG": 0.0020, "XAU": 0.25}
 
-# Минимально допустимый ATR для входов
-ATR_MIN = {"BTC": 0.0, "NG": 0.0020, "XAU": 0.0}
+# --- ATR теперь НЕ БЛОКИРУЕТ сделки: только инфо/вес ---
+ATR_MIN = {"BTC": 0.0, "NG": 0.0, "XAU": 0.0}
 
 # Динамика буфера
 ATR_K   = {"BTC": 7.0, "NG": 0.30, "XAU": 0.55}
@@ -44,14 +44,14 @@ RR_MIN     = 1.10
 MAX_SL_ATR = 1.40
 
 # ---- «Идеи» vs «боевые» входы ----
-CONF_MIN_IDEA   = 0.10   # от этого — присылаем ИДЕЮ (без открытия сессии)
-CONF_MIN_TRADE  = 0.50   # от этого — отправляем полноценный СИГНАЛ (открываем сессию)
+CONF_MIN_IDEA   = 0.20   # ≥ этого — присылаем ИДЕЮ (без открытия сессии)
+CONF_MIN_TRADE  = 0.80   # ≥ этого — отправляем полноценный СИГНАЛ (открываем сессию)
 
 SEND_IDEAS          = True
-IDEA_COOLDOWN_SEC   = 120
-MAX_IDEAS_PER_HOUR  = 10
+IDEA_COOLDOWN_SEC   = 60
+MAX_IDEAS_PER_HOUR  = 30
 
-# Порог уверенности (базовый)
+# Порог уверенности (базовый; для старой логики)
 CONF_MIN = 0.55
 
 SYMBOLS = {
@@ -94,7 +94,7 @@ TRADES_CSV = "gv_trades.csv"
 CC_URL     = "https://min-api.cryptocompare.com/data/v2/histominute?fsym=BTC&tsym=USD&limit=200"
 
 # ---- Локальные пороги только для NATGAS (NG) ----
-RR_MIN_NG         = 1.10
+RR_MIN_NG         = 1.30
 CONF_MIN_NG       = 0.50
 COOLDOWN_SEC_NG   = 8
 IMPULSE_PIPS_NG   = 0.010
@@ -286,10 +286,10 @@ def _df_from_yahoo_v8(payload: dict) -> pd.DataFrame:
             "Close": q.get("close", []),
         }, index=pd.to_datetime(ts, unit="s"))
         df = df.replace([None, np.nan], method="ffill").replace([None, np.nan], method="bfill")
-        df = df.dropna().tail(300).reset_index(drop=True)
+        df = df.dropna().tail(3000).reset_index(drop=True)  # хвост под ресемпл
         for col in ("Open","High","Low","Close"):
             df = df[df[col] > 0]
-        return df.tail(300).reset_index(drop=True)
+        return df.tail(3000).reset_index(drop=True)
     except Exception as e:
         logging.warning(f"Yahoo v8 parse error: {e}")
         return pd.DataFrame()
@@ -302,21 +302,27 @@ def df_from_stooq_csv(text: str):
         df = pd.read_csv(StringIO(text))
         if not {"Open","High","Low","Close"}.issubset(df.columns):
             return pd.DataFrame()
-        return df.tail(300).reset_index(drop=True)
+        return df.tail(3000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
-async def _get_df_ng_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/NG%3DF?interval=1m&range=1d"
+# --- диапазонные фиды для SMC (5d 1m) ---
+async def _get_df_yahoo_range(session: aiohttp.ClientSession, y_ticker_enc: str, interval: str, range_s: str) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{y_ticker_enc}?interval={interval}&range={range_s}"
     data = await _http_get_json_robust(session, url)
     return _df_from_yahoo_v8(data)
 
+async def _get_df_ng_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
+    # для SMC берём не 1d, а 5d 1m чтобы ресемплить H1/H4/M15/M5
+    df = await _get_df_yahoo_range(session, "NG%3DF", "1m", "5d")
+    if df.empty:
+        # запасной короткий
+        df = await _get_df_yahoo_range(session, "NG%3DF", "1m", "1d")
+    return df
+
 async def _get_df_xau_yahoo(session: aiohttp.ClientSession) -> pd.DataFrame:
-    # пробуем спот и фьюч
     for t in ("XAUUSD%3DX", "GC%3DF"):
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"
-        data = await _http_get_json_robust(session, url)
-        df = _df_from_yahoo_v8(data)
+        df = await _get_df_yahoo_range(session, t, "1m", "5d")
         if not df.empty:
             return df
     return pd.DataFrame()
@@ -333,7 +339,6 @@ async def _get_df_ng_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
     return pd.DataFrame()
 
 async def _get_df_xau_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
-    # пробуем форексный тикер и фьюч
     for t in ("xauusd", "gc.f"):
         url = f"https://stooq.com/q/d/l/?s={t}&i=1"
         try:
@@ -348,7 +353,7 @@ async def _get_df_xau_stooq(session: aiohttp.ClientSession) -> pd.DataFrame:
     return pd.DataFrame()
 
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
-    """Единая точка получения цен + кэш."""
+    """Единая точка получения цен + кэш (5д 1м для NG/XAU — под MTF)."""
     global last_candle_close_ts, _prices_cache
     now_ts = time.time()
     cache_ttl = 12.0 if symbol in ("NG", "XAU") else 2.0
@@ -357,7 +362,6 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
         return c["df"]
 
     if symbol == "BTC":
-        # CryptoCompare (как было, просто под robust-запрос)
         try:
             async with aiohttp.ClientSession() as s2:
                 async with s2.get(CC_URL, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
@@ -374,7 +378,7 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
             if "time" in df.columns:
                 last_candle_close_ts["BTC"] = int(df["time"].iloc[-1])
             df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"}, inplace=True)
-            df = df[["Open","High","Low","Close"]].tail(300).reset_index(drop=True)
+            df = df[["Open","High","Low","Close"]].tail(3000).reset_index(drop=True)
             _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"cc"}
             return df
         except Exception as e:
@@ -440,9 +444,11 @@ async def send_idea_message(symbol: str, setup: dict, buffer: float, note: str =
     tp = setup["tp"] + (add if side == "BUY" else -add)
     sl = setup["sl"] - (add if side == "BUY" else -add)
     conf = int(setup.get("conf", 0.0) * 100)
+    why  = setup.get("why","")
     text = (
         f"💡 IDEA {sym} | {tf}\n"
-        f"{'BUY' if side=='BUY' else 'SELL'}  Conf: {conf}%  {note}\n"
+        f"{side}  Conf: {conf}%\n"
+        f"{why}\n"
         f"Entry: {rnd(sym, setup['entry'])}\n"
         f"TP: {rnd(sym, tp)}  SL: {rnd(sym, sl)}  ATR(14)≈{rnd(sym, setup.get('atr',0))}"
     )
@@ -453,7 +459,7 @@ async def send_idea_message(symbol: str, setup: dict, buffer: float, note: str =
     if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
         _ideas_count_hour_ts[symbol] = time.time()
 
-# ===================== STRATEGY =====================
+# ===================== STRATEGY: helpers =====================
 
 def dynamic_buffer(symbol: str, df: pd.DataFrame, atr_now: float) -> float:
     try:
@@ -472,9 +478,9 @@ def trend_side(df: pd.DataFrame) -> str:
 def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str, feats: dict | None = None) -> float:
     rr_part    = max(0.0, min(1.0, (rr - 1.0) / 1.2))   # RR 1.0->0 ; 2.2->1
     trend_part = 0.1 if trend_ok else 0.0
-    tiny_atr_penalty = 0.05 if atr_now < (MIN_SPREAD.get(symbol, 0.0) * 0.2) else 0.0
+    tiny_atr_penalty = 0.0  # ATR не душим
     conf = rr_part + trend_part - tiny_atr_penalty
-    # бусты NG
+    # NG бусты
     if symbol == "NG" and feats:
         if feats.get("impulse_ok"): conf += 0.12
         if feats.get("broke_up") or feats.get("broke_dn"): conf += 0.10
@@ -482,8 +488,204 @@ def _confidence(rr: float, trend_ok: bool, atr_now: float, symbol: str, feats: d
             conf += 0.08
     return max(0.0, min(1.0, conf))
 
+# === MTF: ресемплинг 1m -> M5/M15/H1/H4
+def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    x = df.copy()
+    x.index = pd.to_datetime(x.index) if not isinstance(x.index, pd.DatetimeIndex) else x.index
+    o = x["Open"].resample(rule).first()
+    h = x["High"].resample(rule).max()
+    l = x["Low"].resample(rule).min()
+    c = x["Close"].resample(rule).last()
+    out = pd.concat([o,h,l,c], axis=1)
+    out.columns = ["Open","High","Low","Close"]
+    out = out.dropna()
+    return out
+
+# === SMC core ===
+
+def _swing_points(series: pd.Series, left=2, right=2):
+    """Возвращает локальные high/low индексы (простые свинги)."""
+    highs, lows = [], []
+    vals = series.values
+    for i in range(left, len(vals)-right):
+        seg = vals[i-left:i+right+1]
+        if vals[i] == seg.max(): highs.append(i)
+        if vals[i] == seg.min(): lows.append(i)
+    return highs, lows
+
+def _bos_bias(h4: pd.DataFrame, h1: pd.DataFrame) -> str:
+    """Bias по BOS/EMA: H4 главный, H1 подтверждение."""
+    if len(h4) < 50 or len(h1) < 100:
+        # запасной по EMA
+        return "UP" if ema(h1["Close"], 20).iloc[-1] > ema(h1["Close"], 50).iloc[-1] else "DOWN"
+    highs, lows = _swing_points(h4["Close"], 2, 2)
+    bias = "UP"
+    if len(highs) >= 2 and len(lows) >= 2:
+        last_hh = h4["Close"].iloc[highs[-1]]
+        prev_hh = h4["Close"].iloc[highs[-2]]
+        last_ll = h4["Close"].iloc[lows[-1]]
+        prev_ll = h4["Close"].iloc[lows[-2]]
+        up = last_hh > prev_hh and last_ll >= prev_ll
+        down = last_ll < prev_ll and last_hh <= prev_hh
+        if up: bias = "UP"
+        elif down: bias = "DOWN"
+        else:
+            bias = "UP" if ema(h4["Close"], 20).iloc[-1] > ema(h4["Close"], 50).iloc[-1] else "DOWN"
+    # подтверждение H1
+    h1_ok = ema(h1["Close"], 20).iloc[-1] > ema(h1["Close"], 50).iloc[-1]
+    if bias == "UP" and not h1_ok: bias = "DOWN" if ema(h1["Close"], 20).iloc[-1] < ema(h1["Close"], 50).iloc[-1] else "UP"
+    if bias == "DOWN" and h1_ok: bias = "UP"
+    return bias
+
+def _find_liquidity_m15(m15: pd.DataFrame, hours=4):
+    bars = max(1, int(hours*60/15))
+    look = m15.tail(bars)
+    return float(look["High"].max()), float(look["Low"].min())
+
+def _find_fvg(df: pd.DataFrame, depth=60):
+    """Ищем свежие FVG: gap между [High(t-2)..Low(t)] или наоборот."""
+    out = []
+    n = min(depth, len(df)-2)
+    H, L = df["High"].values, df["Low"].values
+    for i in range(2, 2+n):
+        # бычий FVG: Low[i] > High[i-2]
+        if L[-i] > H[-i-2]:
+            out.append(("bull", float(H[-i-2]), float(L[-i])))
+        # медвежий FVG: High[i] < Low[i-2]
+        if H[-i] < L[-i-2]:
+            out.append(("bear", float(H[-i]), float(L[-i-2])))
+    return out[:5]  # самые свежие
+
+def _choch_trigger(df: pd.DataFrame, direction: str) -> bool:
+    """Простой CHoCH: смена микро-тренда и пробой последнего свинга."""
+    if len(df) < 20: return False
+    c = df["Close"]
+    ema_fast = ema(c, 5); ema_slow = ema(c, 13)
+    trend_up = ema_fast.iloc[-1] > ema_slow.iloc[-1]
+    highs, lows = _swing_points(c, 2, 2)
+    if not highs or not lows: return False
+    last_high = c.iloc[highs[-1]]
+    last_low  = c.iloc[lows[-1]]
+    if direction == "BUY":
+        return (not trend_up) == False and (c.iloc[-1] > last_high)
+    else:
+        return (trend_up == False) and (c.iloc[-1] < last_low)
+
+def _sl_tp_from_structure(side: str, entry: float, m15: pd.DataFrame, m5: pd.DataFrame, target_rr=2.0):
+    """SL за свинг/OB/FVG, TP — к следующей ликвидности; добиваем RR>=target."""
+    # SL — ближайший противоположный свинг на M5
+    _, lows5 = _swing_points(m5["Close"], 2, 2)
+    highs5, _ = _swing_points(m5["Close"], 2, 2)
+    sl = None
+    if side == "BUY" and lows5:
+        sl = float(m5["Low"].iloc[lows5[-1]])
+    if side == "SELL" and highs5:
+        sl = float(m5["High"].iloc[highs5[-1]])
+    if sl is None:
+        # запаска: 0.5×ATR на M5
+        a = float(atr(m5, 10).iloc[-1])
+        sl = entry - a if side == "BUY" else entry + a
+
+    # TP — к ликвидности M15
+    liq_hi, liq_lo = _find_liquidity_m15(m15, 6)
+    if side == "BUY":
+        tp_raw = liq_hi
+        if tp_raw <= entry: tp_raw = entry + (entry - sl) * target_rr
+    else:
+        tp_raw = liq_lo
+        if tp_raw >= entry: tp_raw = entry - (sl - entry) * target_rr
+
+    # гарант RR
+    rr = abs(tp_raw - entry) / max(abs(entry - sl), 1e-9)
+    if rr < target_rr:
+        if side == "BUY":
+            tp_raw = entry + (entry - sl) * target_rr
+        else:
+            tp_raw = entry - (sl - entry) * target_rr
+    return float(sl), float(tp_raw)
+
+def _smc_score(symbol: str, df1m: pd.DataFrame) -> dict:
+    """SMC пайплайн: H4/H1 bias → Liquidity/FVG M15/M5 → CHoCH M5/M1 → score."""
+    out = {"ok": False}
+    if df1m is None or df1m.empty or len(df1m) < 300:
+        return out
+    # MTF
+    m5  = _resample_ohlc(df1m.set_index(pd.to_datetime(df1m.index)), "5min")
+    m15 = _resample_ohlc(df1m.set_index(pd.to_datetime(df1m.index)), "15min")
+    h1  = _resample_ohlc(df1m.set_index(pd.to_datetime(df1m.index)), "1H")
+    h4  = _resample_ohlc(df1m.set_index(pd.to_datetime(df1m.index)), "4H")
+    if min(len(m5),len(m15),len(h1),len(h4)) < 20:
+        return out
+
+    # Bias
+    bias = _bos_bias(h4, h1)  # "UP"/"DOWN"
+
+    # Liquidity pools (M15)
+    liq_hi, liq_lo = _find_liquidity_m15(m15, hours=4)
+
+    # FVG/OB (упростим OB как свинг-блок, для скоринга хватит FVG)
+    fvgs15 = _find_fvg(m15, depth=40)
+    bull_fvg = next((f for f in fvgs15 if f[0]=="bull"), None)
+    bear_fvg = next((f for f in fvgs15 if f[0]=="bear"), None)
+
+    # Ложный пробой M15/M5: касание/небольшой прокол зоны ликвидности в сторону против bias
+    last_m5 = float(m5["Close"].iloc[-1])
+    fake_out = False
+    if bias == "UP":
+        # сняли лоу и отскочили
+        fake_out = (float(m5["Low"].iloc[-1]) <= liq_lo and last_m5 > liq_lo)
+    else:
+        fake_out = (float(m5["High"].iloc[-1]) >= liq_hi and last_m5 < liq_hi)
+
+    # CHoCH на M5/M1 (проверим по M5)
+    side = "BUY" if bias == "UP" else "SELL"
+    choch = _choch_trigger(m5, side)
+
+    # Скоринг
+    score = 0
+    why = []
+    # база: зона входа (FVG в сторону bias)
+    if side == "BUY" and bull_fvg: score += 50; why.append("FVG↑ M15")
+    if side == "SELL" and bear_fvg: score += 50; why.append("FVG↓ M15")
+    # охота на стопы + возврат
+    if fake_out: score += 30; why.append("Stop-hunt OK")
+    # совпадение с Global Bias
+    score += 20; why.append(f"Bias {bias}")
+    # тренд-фаза (ATR H1 vs средний)
+    a_now = float(atr(h1, 14).iloc[-1]); a_ref = float(atr(h1, 100).iloc[-1]) if len(h1) >= 110 else a_now
+    if a_ref > 0 and a_now >= 1.2 * a_ref:
+        score += 10; why.append("Trend phase (vol ↑)")
+    # триггер CHoCH
+    if choch: score += 20; why.append("CHoCH M5")
+
+    score = max(0, min(100, score))
+    if score < 20:
+        out["ok"] = False
+        return out
+
+    # ENTRY — по текущему закрытому M1 (берём 1m df1m последний закрытый)
+    entry = float(df1m["Close"].iloc[-2])
+
+    # SL/TP из структуры (RR ≥ 2.0)
+    sl, tp = _sl_tp_from_structure(side, entry, m15, m5, target_rr=2.0)
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+
+    out.update({
+        "ok": True,
+        "score": score,
+        "side": side,
+        "bias": bias,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "why": ", ".join(why),
+    })
+    return out
+
+# ===================== NG nowcast (оставил как было) =====================
+
 def _ng_nowcast(df: pd.DataFrame) -> dict:
-    """Лёгкий nowcast (p_up) для NG по закрытым барам."""
     feats = {"p_up": 0.5, "impulse_ok": False, "broke_up": False, "broke_dn": False, "ema_up": False, "ema_dn": False}
     try:
         if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 5:
@@ -505,37 +707,31 @@ def _ng_nowcast(df: pd.DataFrame) -> dict:
         atr_now = float(df_tmp["ATR"].iloc[closed])
         if not np.isfinite(atr_now) or atr_now <= 0: return feats
 
-        # импульс
         r1 = c[closed]   - c[closed-1]
         r2 = c[closed-1] - c[closed-2]
         accel = (r1 - r2) / max(atr_now, 1e-12)
 
-        # ema наклоны
         slope_fast = (ema_fast[closed] - ema_fast[closed-2]) / max(atr_now, 1e-12)
         slope_slow = (ema_slow[closed] - ema_slow[closed-2]) / max(atr_now, 1e-12)
         ema_combo = slope_fast + 0.7 * slope_slow
 
-        # расширение волатильности
         atr_ref = float(pd.Series(df_tmp["ATR"]).rolling(20).mean().iloc[closed])
         vol_expand = 0.0
         if np.isfinite(atr_ref) and atr_ref > 0:
             vol_expand = (atr_now / atr_ref) - 1.0
 
-        # предпробой
         N = 12
         window_c = c[closed-N:closed+1]
         prebreak_up   = (c[closed] - window_c.min()) / max(atr_now, 1e-12)
         prebreak_down = (window_c.max() - c[closed]) / max(atr_now, 1e-12)
         prebreak = prebreak_up - prebreak_down
 
-        # свечная «тяжесть»
         body = abs(c[closed-1] - o[closed-1])
         rng  = max(h[closed-1] - l[closed-1], 1e-12)
         upper = h[closed-1] - max(c[closed-1], o[closed-1])
         lower = min(c[closed-1], o[closed-1]) - l[closed-1]
         candle_bias = ((lower - upper) / rng) + ((c[closed-1] - l[closed-1]) / rng - 0.5)
 
-        # простые булеаны (для бустов/логов)
         feats["impulse_ok"] = abs(c[closed] - c[closed-1]) >= IMPULSE_PIPS_NG
         Nbr = LOOKBACK_BREAK_NG
         hi = float(np.max(h[closed-(Nbr+1):closed-1])) if closed-(Nbr+1) >= 0 else np.nan
@@ -545,7 +741,6 @@ def _ng_nowcast(df: pd.DataFrame) -> dict:
         feats["ema_up"]   = bool(ema_fast[closed] > ema_slow[closed])
         feats["ema_dn"]   = bool(ema_fast[closed] < ema_slow[closed])
 
-        # скор -> вероятность
         w1, w2, w3, w4, w5 = 2.4, 2.0, 1.8, 1.2, 0.8
         score = (w1 * ( (r1 - r2) / max(atr_now, 1e-12) ) +
                  w2 * ema_combo +
@@ -557,6 +752,8 @@ def _ng_nowcast(df: pd.DataFrame) -> dict:
     except Exception:
         return feats
 
+# ===================== BUILD SETUP =====================
+
 def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if df is None or df.empty or len(df) < max(ATR_PERIOD, EMA_SLOW) + 3:
         return None
@@ -567,22 +764,36 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
     if not np.isfinite(atr_now) or atr_now <= 0:
         return None
 
-    # ATR-порог для NG
-    if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
-        return None
+    # --- SMC логика В ПРИОРИТЕТЕ для NG/XAU ---
+    if symbol in ("NG", "XAU"):
+        smc = _smc_score(symbol, df.set_index(pd.to_datetime(df.index)))
+        if smc.get("ok", False):
+            side = smc["side"]
+            entry = smc["entry"]
+            sl = smc["sl"]
+            tp = smc["tp"]
+            rr = float(smc["rr"])
+            conf = smc["score"] / 100.0
+            signature = sig_id(symbol, side, side, atr_now, tf_label)
+            return {
+                "symbol": symbol, "tf": tf_label,
+                "side": side, "trend": smc["bias"],
+                "entry": entry, "tp": tp, "sl": sl,
+                "atr": atr_now, "rr": rr, "conf": conf,
+                "sig": signature, "why": smc.get("why","")
+            }
+        # если SMC не дало ок — падать на старую (мягко)
 
+    # ---- Старая логика (fallback / для BTC) ----
     side_tr = trend_side(df)     # тренд по EMA (на текущем баре)
     last    = df.iloc[-2]        # закрытый бар
     entry   = float(last["Close"])
 
-    # NG nowcast/feats
     feats = _ng_nowcast(df) if symbol == "NG" else None
 
-    # локальные пороги
     rr_min   = RR_MIN_NG   if symbol == "NG" else RR_MIN
     conf_min = CONF_MIN_NG if symbol == "NG" else CONF_MIN
 
-    # динамические TP/SL через ATR (как было)
     p = stats.get(symbol, deepcopy(DEFAULT_PARAMS))
     tp_mul = float(p["tp_mul"]) * float(p["risk"])
     sl_mul = float(p["sl_mul"]) * float(1.0 / p["risk"])
@@ -603,10 +814,7 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
         tp = raw_tp
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-    if rr < rr_min:
-        return None
 
-    # бонус к уверенности от nowcast (NG)
     nowcast_extra = 0.0
     if symbol == "NG" and feats:
         p_up = float(feats.get("p_up", 0.5))
@@ -616,10 +824,6 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
             nowcast_extra = 0.10 + (0.05 if p_up <= 0.34 else 0.0)
 
     conf_base = _confidence(rr, True, atr_now, symbol, feats)
-    if conf_base < conf_min and conf_base + nowcast_extra < conf_min:
-        # слишком слабо даже с бустом — вернём None
-        return None
-
     conf = max(0.0, min(1.0, conf_base + nowcast_extra))
 
     signature = sig_id(symbol, side, side_tr, atr_now, tf_label)
@@ -628,6 +832,7 @@ def build_setup(df: pd.DataFrame, symbol: str, tf_label: str):
         "side": side, "trend": side_tr,
         "entry": entry, "tp": tp, "sl": sl,
         "atr": atr_now, "rr": rr, "conf": conf, "sig": signature,
+        "why": "fallback"
     }
 
 def format_signal(setup, buffer):
@@ -635,12 +840,15 @@ def format_signal(setup, buffer):
     add = BUF_K_TO_LEVEL.get(sym, 1.0) * buffer
     tp = setup["tp"] + (add if side == "BUY" else -add)
     sl = setup["sl"] - (add if side == "BUY" else -add)
+    why = setup.get("why","")
     lines = [
         f"🔥 {side} {SYMBOLS[sym]['name']} | {tf}",
         f"✅ TP: **{rnd(sym, tp)}**",
         f"🟥 SL: **{rnd(sym, sl)}**",
-        f"Entry: {rnd(sym, setup['entry'])}  Spread≈{rnd(sym, buffer)}  ATR(14)≈{rnd(sym, setup['atr'])}  Conf: {int(setup['conf']*100)}%  Trend: {setup['trend']}"
+        f"Entry: {rnd(sym, setup['entry'])}  Spread≈{rnd(sym, buffer)}  ATR(14)≈{rnd(sym, setup['atr'])}  Conf: {int(setup['conf']*100)}%  Trend: {setup.get('trend','')}",
     ]
+    if why:
+        lines.append(f"📌 {why}")
     return "\n".join(lines)
 
 # ===================== LEARNING =====================
@@ -817,10 +1025,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     last_candle_close_ts[symbol] = time.time()
     atr_now = float(atr(df, ATR_PERIOD).iloc[-1])
     val = rnd(symbol, atr_now)
-    if symbol == "NG" and atr_now < ATR_MIN.get("NG", 0.0):
-        state[f"atr_{symbol}"] = f"{val} (low)"
-    else:
-        state[f"atr_{symbol}"] = val
+    state[f"atr_{symbol}"] = val
 
     logging.info(f"HB {symbol}: last_close={rnd(symbol, float(df['Close'].iloc[-1]))} ATR≈{rnd(symbol, atr_now)}")
 
@@ -876,19 +1081,21 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     tp_show = setup["tp"] + (add if side == "BUY" else -add)
     sl_show = setup["sl"] - (add if side == "BUY" else -add)
 
-    # уверенность
+    # уверенность/скор
     conf = float(setup.get("conf", 0.0))
     pct  = int(round(conf * 100))
     rr_v = round(float(setup.get("rr", 0.0)), 2)
     entry = rnd(symbol, setup["entry"])
     atr_v = rnd(symbol, setup["atr"])
     name = SYMBOLS[symbol]["name"]
+    why  = setup.get("why","")
 
     # шлём «идею», если дозволено
     if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
         txt = (
             f"{'⚡️ СДЕЛКА' if conf >= CONF_MIN_TRADE else '💡 ИДЕЯ'} {name} | {SYMBOLS[symbol]['tf']}\n"
             f"{side} | Conf: {pct}%  RR≈{rr_v}  ATR≈{atr_v}\n"
+            f"{('📌 '+why) if why else ''}\n"
             f"Entry: {entry}\n"
             f"TP: {rnd(symbol, tp_show)}   SL: {rnd(symbol, sl_show)}"
         )
@@ -897,7 +1104,11 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     # открываем «боевую» только при торговом пороге
     if conf >= CONF_MIN_TRADE:
         if not allow_after_sl(symbol, setup["sig"], time.time()): return
-        await send_signal(symbol, setup, base_buffer)
+        # полноценный сигнал
+        pretty_setup = dict(setup)
+        pretty_setup["tp"] = tp_show
+        pretty_setup["sl"] = sl_show
+        await send_signal(symbol, pretty_setup, base_buffer)
         trade[symbol] = {
             "side": setup["side"],
             "entry": float(setup["entry"]),
@@ -922,7 +1133,7 @@ async def engine_loop():
 
 # ===================== MAIN =====================
 
-router = Router()  # (повтор тут безобиден, но выше уже подключен)
+router = Router()  # (повтор безвреден)
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     global mode, requested_mode, last_mode_switch_ts
@@ -937,4 +1148,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-

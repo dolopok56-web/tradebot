@@ -32,7 +32,7 @@ LOG_BOT_TOKEN  = "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw"
 OWNER_ID = 6784470762
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
-log_bot = Bot(LOG_BOT_TOKEN, default=DefaultBotProperties((parse_mode=None))
+log_bot = Bot(LOG_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 
 # ===================== УТИЛИТЫ =====================
 def rnd(sym, val): return round(float(val), 4)
@@ -293,3 +293,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

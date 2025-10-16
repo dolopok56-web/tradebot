@@ -31,8 +31,8 @@ MAIN_BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
 LOG_BOT_TOKEN  = "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw"
 OWNER_ID = 6784470762
 
-bot = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
-log_bot = Bot(LOG_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
+log_bot = Bot(LOG_BOT_TOKEN, default=DefaultBotProperties((parse_mode=None))
 
 # ===================== УТИЛИТЫ =====================
 def rnd(sym, val): return round(float(val), 4)
@@ -137,7 +137,7 @@ def _fib_ote_ok(a,b,price):
 # ===================== DXY Bias для золота =====================
 async def get_dxy_bias(session):
     try:
-        df = await get_df(session,"DXY")  # <-- если DXY подключён как отдельный инструмент
+        df = t get_df(session,"DXY")  # <-- если DXY подключён как отдельный инструмент
         df60 = _resample(df,60)
         df240 = _resample(df,240)
         return _bias_bos_higher(df60,df240)
@@ -234,10 +234,10 @@ def format_signal(setup, buffer):
 
 # ===================== MAIN HANDLE =====================
 async def handle_symbol(session, symbol):
-    df = await get_df(session, symbol)
+    df = t get_df(session, symbol)
     dxy_bias = None
     if symbol=="XAU":
-        dxy_bias = await get_dxy_bias(session)
+        dxy_bias = t get_dxy_bias(session)
 
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"], dxy_bias=dxy_bias)
     if not setup: return
@@ -248,19 +248,19 @@ async def handle_symbol(session, symbol):
 
     # IDEA
     if conf >= CONF_MIN_IDEA:
-        await bot.send_message(OWNER_ID, "🧠 IDEA:\n"+format_signal(setup,buffer))
+        t bot.send_message(OWNER_ID, "🧠 IDEA:\n"+format_signal(setup,buffer))
 
     # TRADE
     if conf >= CONF_MIN_TRADE and rr >= RR_TRADE_MIN and setup["tp_abs"] >= setup["tp_min"]:
-        await bot.send_message(OWNER_ID, format_signal(setup, buffer))
+        t bot.send_message(OWNER_ID, format_signal(setup, buffer))
 
 # ===================== ALIVE LOOP =====================
 async def alive_loop():
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                df_ng = await get_df(s,"NG")
-                df_xau = await get_df(s,"XAU")
+                df_ng = t get_df(s,"NG")
+                df_xau = t get_df(s,"XAU")
             def _atr_m15(df):
                 d=_resample(df,15)
                 tr=(d["High"]-d["Low"]).rolling(14).mean()
@@ -270,26 +270,26 @@ async def alive_loop():
             a_ng=_atr_m15(df_ng) if not df_ng.empty else 0
             a_xau=_atr_m15(df_xau) if not df_xau.empty else 0
             msg=f"[ALIVE] NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} | XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)}. Status: OK."
-            await log_bot.send_message(OWNER_ID,msg)
+            t log_bot.send_message(OWNER_ID,msg)
         except Exception as e:
-            await log_bot.send_message(OWNER_ID,f"[ALIVE ERROR] {e}")
-        await asyncio.sleep(300)
+            t log_bot.send_message(OWNER_ID,f"[ALIVE ERROR] {e}")
+        t asyncio.sleep(300)
 
 # ===================== MAIN LOOP =====================
 async def main_loop():
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                await handle_symbol(s,"NG")
-                await handle_symbol(s,"XAU")
+                t handle_symbol(s,"NG")
+                t handle_symbol(s,"XAU")
         except Exception as e:
-            await log_bot.send_message(OWNER_ID,f"[ERROR] {e}")
-        await asyncio.sleep(60)  # проверка каждую минуту
+            t log_bot.send_message(OWNER_ID,f"[ERROR] {e}")
+        t asyncio.sleep(60)  # проверка каждую минуту
 
 # ===================== RUN =====================
 async def main():
     asyncio.create_task(alive_loop())
-    await main_loop()
+    t main_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())

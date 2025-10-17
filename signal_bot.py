@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-TradeBot V5.0 — «ЧЕЛОВЕК-ТРЕЙДЕР»
-— Чистый SMC-аналитик без душных фильтров: ATR/EMA/RSI не влияют на входы
-— Мультитаймфрейм (H4/H1/M15/M5/M1) через ресемпл из 1m свечей
-— «Мягкие глаза»: FVG максимально ослаблен (ищет микрогэпы), CHoCH мягкий
-— 7-факторный скоринг (Stop-hunt, OTE, дисбаланс FVG, сессия, консолидация, OB-митигация, DXY для золота)
-— ИДЕИ: CONF>=0.05 ; ТРЕЙДЫ: CONF>=0.55 и RR>=1.0 и TP>=0.005
+TradeBot V5.1 — «ТОЧНАЯ ПУШКА»
+— Чистый SMC-аналитик (без ATR/EMA/RSI во входах)
+— Мультитаймфрейм (H4/H1/M15/M5/M1) через ресемпл 1m
+— «Мягкие глаза»: FVG/CHoCH ослаблены (детектят микрогэпы/мягкий пробой)
+— 7-факторный скоринг (Stop-hunt, OTE, FVG дисбаланс, сессия, консолидация, OB-митигация, DXY для XAU)
+— ИДЕИ: CONF≥0.05 и RR≥0.50 (НОВЫЙ ФИЛЬТР КАЧЕСТВА)
+— ТРЕЙДЫ: CONF≥0.55 и RR≥1.0 и TP≥0.005
+— Фильтр свежести сигналов (НОВЫЙ): игнор, если |Entry - Close_now| > 10*SpreadBuf
 — Буфер спреда: NG=0.0020, XAU=0.20
 — Живой отчёт (ALIVE) каждые 5 минут — во второй лог-бот
+— /start и /status исправлены/реализованы
 """
 
 import os, time, json, csv, math, logging, asyncio, random
@@ -28,7 +31,7 @@ from aiogram.filters import Command
 
 # ===================== CONFIG =====================
 
-VERSION = "V5.0 Human-Trader (pure SMC, soft FVG/CHoCH, 7factors, alive)"
+VERSION = "V5.1 Human-Trader (pure SMC, soft FVG/CHoCH, 7factors, ALIVE, fresh+quality filters)"
 
 # --- Telegram
 MAIN_BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"  # сигналы/идеи
@@ -46,10 +49,17 @@ DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20}
 
 # --- Пороги активности
-CONF_MIN_IDEA   = 0.05     # шлём ИДЕИ от 5%
-CONF_MIN_TRADE  = 0.55     # боевой сигнал от 55%
-RR_TRADE_MIN    = 1.00     # трейд, только если TP>=SL (RR>=1.0)
+CONF_MIN_IDEA   = 0.05     # базовый порог идей
+CONF_MIN_TRADE  = 0.55     # боевой сигнал
+RR_TRADE_MIN    = 1.00     # трейд, только если TP>=SL
 TP_MIN_TRADE    = {"NG": 0.005, "XAU": 0.005}
+
+# === НОВОЕ (V5.1): ФИЛЬТР КАЧЕСТВА ДЛЯ ИДЕЙ ===
+RR_MIN_IDEA     = 0.50     # идеи только если RR>=0.50
+
+# === НОВОЕ (V5.1): ФИЛЬТР СВЕЖЕСТИ СИГНАЛОВ ===
+FRESH_MULT      = 10.0     # множитель к буферу
+# NG: 10*0.002 = 0.02 ; XAU: 10*0.20 = 2.0
 
 # --- Антиспам ИДЕЙ
 SEND_IDEAS           = True
@@ -123,7 +133,41 @@ async def send_log(text: str):
 
 @router.message(Command("start"))
 async def cmd_start(m: Message):
-    await m.answer(f"✅ TradeBot {VERSION} запущен.\nИдеи от {int(CONF_MIN_IDEA*100)}%, трейды RR≥{RR_TRADE_MIN:.2f}, CONF≥{int(CONF_MIN_TRADE*100)}%.")
+    await m.answer(
+        f"✅ TradeBot {VERSION} запущен.\n"
+        f"IDEA: CONF≥{int(CONF_MIN_IDEA*100)}% и RR≥{RR_MIN_IDEA:.2f} | "
+        f"TRADE: CONF≥{int(CONF_MIN_TRADE*100)}% и RR≥{RR_TRADE_MIN:.2f} и TP≥0.005.\n"
+        f"Свежесть фильтр: |Entry-Close_now| ≤ 10×SpreadBuf."
+    )
+
+@router.message(Command("status"))
+async def cmd_status(m: Message):
+    """НОВОЕ (V5.1): /status — короткая диагностика в реальном времени"""
+    try:
+        async with aiohttp.ClientSession() as s:
+            ng = await get_df(s, "NG")
+            xau = await get_df(s, "XAU")
+        def _atr_m15(df):
+            d=_resample(df,15)
+            if d.empty: return 0.0
+            tr=(d["High"]-d["Low"]).rolling(14).mean()
+            return float(tr.iloc[-1]) if not tr.empty and pd.notna(tr.iloc[-1]) else 0.0
+        c_ng  = float(ng["Close"].iloc[-1])  if not ng.empty else 0.0
+        c_xau = float(xau["Close"].iloc[-1]) if not xau.empty else 0.0
+        a_ng  = _atr_m15(ng)  if not ng.empty else 0.0
+        a_xau = _atr_m15(xau) if not xau.empty else 0.0
+        now = time.time()
+        lines = [
+            f"mode: AUTO (NG+XAU)",
+            f"NG: open={bool(trade['NG'])} cooldown={max(0,int(cooldown_until['NG']-now))}s "
+            f"last_close_age={max(0,int(now - (last_candle_close_ts['NG'] or now)))}s",
+            f"XAU: open={bool(trade['XAU'])} cooldown={max(0,int(cooldown_until['XAU']-now))}s "
+            f"last_close_age={max(0,int(now - (last_candle_close_ts['XAU'] or now)))}s",
+            f"Prices — NG: {rnd('NG',c_ng)}  (ATR15≈{rnd('NG',a_ng)}) | XAU: {rnd('XAU',c_xau)}  (ATR15≈{rnd('XAU',a_xau)})"
+        ]
+        await m.answer("```\n" + "\n".join(lines) + "\n```")
+    except Exception as e:
+        await m.answer(f"Ошибка /status: {e}")
 
 @router.message(F.text.lower() == "стоп")
 async def cmd_stop(m: Message):
@@ -169,11 +213,6 @@ async def _yahoo_json(session: aiohttp.ClientSession, url: str) -> dict:
             await asyncio.sleep(backoff + (random.random()*YAHOO_JITTER))
             backoff *= 1.6
     return {}
-
-async def _get_df_yahoo_1m(session, ticker: str) -> pd.DataFrame:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
-    data = await _yahoo_json(session, url)
-    return _df_from_yahoo_v8(data)
 
 def _df_from_stooq_csv(text: str):
     try:
@@ -260,7 +299,7 @@ def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     """Ресемпл по фактическому временному индексу (мягко к дыркам)."""
     if df is None or df.empty:
         return pd.DataFrame()
-    # создадим временной индекс с 1m шагом от первого до последнего таймстемпа
+    # приблизительный индекс с 1m шагом
     idx = pd.date_range(start=pd.Timestamp.utcnow().floor('D'), periods=len(df), freq="1min")
     z = df.copy()
     z.index = idx
@@ -293,7 +332,7 @@ def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True,
     """
     МАКСИМАЛЬНО МЯГКИЙ поиск FVG за последние `lookback` баров.
     — Допускаем микрогэпы (min_abs=0) по телам (use_bodies=True)
-    — Можно дополнительно требовать ширину как долю средней свечи (min_rel_to_avg), по умолчанию = 0
+    — Можно требовать ширину как долю средней свечи (min_rel_to_avg), по умолчанию 0
     Возвращает: (has_fvg, dir, top, bot, width)
     """
     n = len(df)
@@ -302,7 +341,6 @@ def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True,
 
     avg_rng = float((df["High"] - df["Low"]).tail(max(lookback, 12)).mean() or 0.0)
 
-    # пробегаем от свежего к старому
     for i in range(n-2, max(1, n - lookback) - 1, -1):
         if use_bodies:
             h2 = max(float(df["Open"].iloc[i-2]), float(df["Close"].iloc[i-2]))
@@ -313,14 +351,12 @@ def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True,
             h2 = float(df["High"].iloc[i-2]); l2 = float(df["Low"].iloc[i-2])
             h0 = float(df["High"].iloc[i]);   l0 = float(df["Low"].iloc[i])
 
-        # BULL FVG: нижняя граница текущего бара выше верхней границы бара i-2
         if l0 > h2:
             top, bot = l0, h2
             width = abs(top - bot)
             if width >= min_abs and (min_rel_to_avg <= 0.0 or (avg_rng > 0 and width >= min_rel_to_avg * avg_rng)):
                 return True, "BULL", top, bot, width
 
-        # BEAR FVG
         if h0 < l2:
             top, bot = h2, l0
             width = abs(top - bot)
@@ -352,7 +388,7 @@ def choch_soft(df: pd.DataFrame, want: str, swing_lookback: int = 8, confirm_bre
 # ===================== Остальной SMC =====================
 
 def bias_bos_higher(df60, df240) -> str:
-    """Грубый H1/H4 bias: если текущий close выше swing-high — UP; ниже swing-low — DOWN; иначе — UP по умолчанию."""
+    """Грубый H1/H4 bias."""
     if df60 is None or df60.empty or df240 is None or df240.empty: return "UP"
     c1 = float(df60["Close"].iloc[-2])
     hh4 = _swing_high(df240, 20)
@@ -386,14 +422,13 @@ def is_consolidation_break(df):
     rng = float((window["High"].max() - window["Low"].min()) or 0.0)
     base = float(window["Close"].iloc[-1])
     if base <= 0: return False
-    # «узкая» консолидация
     if (rng / base) <= 0.003:
         H = float(df["High"].iloc[i]); L = float(df["Low"].iloc[i])
         return H > window["High"].max() or L < window["Low"].min()
     return False
 
 def inside_higher_ob(df_low, df_high):
-    """Грубое попадание текущей цены в тело последней H1/H4 свечи (как суррогат OB-митигации)."""
+    """Суррогат OB-митигации: попадание текущей цены в тело последней H1/H4 свечи."""
     if df_low is None or df_low.empty or df_high is None or df_high.empty: return False
     if len(df_low) < 5 or len(df_high) < 5: return False
     cl  = float(df_low["Close"].iloc[-2])
@@ -468,7 +503,6 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
 
     if side == "BUY":
         sl = min(entry, lo15 - buf)       # SL только по структуре + буфер
-        # TP — следующая явная LP: минимум цель — ближайший swing-high
         tp = hi15 if hi15 > entry else entry + max(entry-(sl), 1e-9)
     else:
         sl = max(entry, hi15 + buf)
@@ -481,9 +515,9 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     # ===== 7-ФАКТОРНЫЙ СКОРИНГ =====
     score = 0
 
-    # (0) БАЗА: FVG/CHoCH — если что-то есть, даём широкую базу
+    # (0) БАЗА: FVG/CHoCH
     base_ok = (fvg_ok or choch_ok)
-    score += 40 if base_ok else 10  # очень мягко: даже 10, если «почти пусто»
+    score += 40 if base_ok else 10  # мягкая база
 
     # (1) OTE (Фибо 62–79) — +10
     last15 = df15.iloc[-2]
@@ -493,7 +527,7 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     # (2) Stop-hunt — +10
     if sweep15: score += 10
 
-    # (3) Дисбаланс/сила FVG — +7 (если FVG заметно шире средней свечи)
+    # (3) Дисбаланс/сила FVG — +7
     if fvg_ok:
         avg_rng = float((df15["High"] - df15["Low"]).tail(20).mean() or 0.0)
         if avg_rng > 0 and fvg_w >= 1.5 * avg_rng:
@@ -505,7 +539,7 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     # (5) Выход из консолидации — +12
     if is_consolidation_break(df5): score += 12
 
-    # (6) OB-митигация (H1/H4 суррогат телом свечи) — +15
+    # (6) OB-митигация — +15
     if inside_higher_ob(df5, df60) or inside_higher_ob(df5, df240): score += 15
 
     # (7) DXY корреляция — ТОЛЬКО для XAU — +15
@@ -580,6 +614,12 @@ def can_send_idea(sym: str) -> bool:
         return False
     return True
 
+def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
+    """НОВОЕ (V5.1): фильтр свежести — цена не должна «уйти» дальше 10×SpreadBuf."""
+    buf = SPREAD_BUFFER.get(symbol, 0.0)
+    lim = FRESH_MULT * buf
+    return abs(float(entry) - float(close_now)) <= lim
+
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
     global last_seen_idx, last_signal_idx
 
@@ -631,13 +671,19 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         return
     last_signal_idx[symbol] = closed_idx
 
-    # форматы/отправка
-    buffer = dynamic_buffer(symbol)
-    conf = float(setup["conf"])
-    rr   = float(setup["rr"])
+    buffer   = dynamic_buffer(symbol)
+    conf     = float(setup["conf"])
+    rr       = float(setup["rr"])
+    close_now = float(df["Close"].iloc[-1])  # НОВОЕ (V5.1): текущая цена для фильтра свежести
+    entry    = float(setup["entry"])
 
-    # IDEA
-    if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
+    # === НОВОЕ (V5.1): ФИЛЬТР СВЕЖЕСТИ ===
+    if not is_fresh_enough(symbol, entry, close_now):
+        # рынок «ушёл» — игнорируем и не спамим
+        return
+
+    # IDEA (c фильтром качества RR>=0.50)
+    if conf >= CONF_MIN_IDEA and rr >= RR_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
         _ideas_count_hour[symbol] = _ideas_count_hour.get(symbol, 0) + 1
@@ -705,7 +751,7 @@ async def main():
     # запускаем движок + alive-логгер
     asyncio.create_task(engine_loop())
     asyncio.create_task(alive_loop())
-    # телеграм поллинг для /start и "стоп"
+    # телеграм поллинг для /start, /status, "стоп"
     await dp.start_polling(main_bot)
 
 if __name__ == "__main__":

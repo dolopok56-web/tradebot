@@ -118,61 +118,88 @@ _prices_cache = {}
 # ===================== TELEGRAM =====================
 
 router = Router()
-main_bot = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
-log_bot  = Bot(LOG_BOT_TOKEN,  default=DefaultBotProperties(parse_mode=None))
-dp = Dispatcher()
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+dp  = Dispatcher()
 dp.include_router(router)
 
-async def send_main(text: str):
-    try: await main_bot.send_message(OWNER_ID, text)
-    except: pass
+def mode_title(m):
+    return {"BTC":"BITCOIN (BTC-USD)","NG":"NATGAS (NG=F)","XAU":"GOLD (XAUUSD)","AUTO":"NATGAS+GOLD (AUTO)"}\
+        .get(m,m)
 
-async def send_log(text: str):
-    try: await log_bot.send_message(OWNER_ID, text)
-    except: pass
+async def _request_mode(new_mode: str, m: Message = None):
+    global requested_mode
+    requested_mode = new_mode
+    save_state()
+    if m:
+        await m.answer(f"✅ Режим {new_mode}: слежу за {mode_title(new_mode)}.")
 
 @router.message(Command("start"))
 async def cmd_start(m: Message):
+    await m.answer(f"✅ Bot is alive ({VERSION}).\nНапиши 'команды' чтобы увидеть список.\nПо умолчанию режим BTC.")
+    await m.answer(f"✅ Режим {mode}: слежу за {mode_title(mode)}.")
+
+@router.message(F.text.lower() == "команды")
+async def cmd_help(m: Message):
     await m.answer(
-        f"✅ TradeBot {VERSION} запущен.\n"
-        f"IDEA: CONF≥{int(CONF_MIN_IDEA*100)}% и RR≥{RR_MIN_IDEA:.2f} | "
-        f"TRADE: CONF≥{int(CONF_MIN_TRADE*100)}% и RR≥{RR_TRADE_MIN:.2f} и TP≥0.005.\n"
-        f"Свежесть фильтр: |Entry-Close_now| ≤ 10×SpreadBuf."
+        "📋 Команды:\n"
+        "• /start — запуск\n"
+        "• команды — список\n"
+        "• биток / газ / золото / авто — выбор рынка\n"
+        "• стоп — стоп и короткий кулдаун\n"
+        "• статус — диагностика\n"
+        "• отчет — 10 последних закрытий (только владелец)\n"
+        "• тест — вывести тест-сигнал (диагностика форматирования)"
     )
 
-@router.message(Command("status"))
-async def cmd_status(m: Message):
-    """НОВОЕ (V5.1): /status — короткая диагностика в реальном времени"""
-    try:
-        async with aiohttp.ClientSession() as s:
-            ng = await get_df(s, "NG")
-            xau = await get_df(s, "XAU")
-        def _atr_m15(df):
-            d=_resample(df,15)
-            if d.empty: return 0.0
-            tr=(d["High"]-d["Low"]).rolling(14).mean()
-            return float(tr.iloc[-1]) if not tr.empty and pd.notna(tr.iloc[-1]) else 0.0
-        c_ng  = float(ng["Close"].iloc[-1])  if not ng.empty else 0.0
-        c_xau = float(xau["Close"].iloc[-1]) if not xau.empty else 0.0
-        a_ng  = _atr_m15(ng)  if not ng.empty else 0.0
-        a_xau = _atr_m15(xau) if not xau.empty else 0.0
-        now = time.time()
-        lines = [
-            f"mode: AUTO (NG+XAU)",
-            f"NG: open={bool(trade['NG'])} cooldown={max(0,int(cooldown_until['NG']-now))}s "
-            f"last_close_age={max(0,int(now - (last_candle_close_ts['NG'] or now)))}s",
-            f"XAU: open={bool(trade['XAU'])} cooldown={max(0,int(cooldown_until['XAU']-now))}s "
-            f"last_close_age={max(0,int(now - (last_candle_close_ts['XAU'] or now)))}s",
-            f"Prices — NG: {rnd('NG',c_ng)}  (ATR15≈{rnd('NG',a_ng)}) | XAU: {rnd('XAU',c_xau)}  (ATR15≈{rnd('XAU',a_xau)})"
-        ]
-        await m.answer("```\n" + "\n".join(lines) + "\n```")
-    except Exception as e:
-        await m.answer(f"Ошибка /status: {e}")
+@router.message(F.text.lower() == "биток")
+async def set_btc(m: Message): await _request_mode("BTC", m)
+
+@router.message(F.text.lower() == "газ")
+async def set_ng(m: Message):  await _request_mode("NG", m)
+
+@router.message(F.text.lower() == "золото")
+async def set_xau(m: Message): await _request_mode("XAU", m)
+
+@router.message(F.text.lower() == "авто")
+async def set_auto(m: Message): await _request_mode("AUTO", m)
 
 @router.message(F.text.lower() == "стоп")
 async def cmd_stop(m: Message):
     for s in trade.keys(): trade[s] = None; cooldown_until[s] = time.time() + 5
     await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
+
+@router.message(F.text.lower() == "статус")
+async def cmd_status(m: Message):
+    lines = [f"mode: {mode} (requested: {requested_mode})"]
+    now = time.time()
+    for s in ["BTC","NG","XAU"]:
+        opened = bool(trade[s])
+        age = int(now - last_candle_close_ts[s]) if last_candle_close_ts[s] else -1
+        atrtxt = state.get(f"atr_{s}", "—")
+        lines.append(f"{SYMBOLS[s]['name']}: open={opened}  cooldown={max(0,int(cooldown_until[s]-now))}  ATR≈{atrtxt}  last_close_age={age}s")
+    await m.answer("```\n"+ "\n".join(lines) + "\n```")
+
+@router.message(F.text.lower() == "отчет")
+async def cmd_report(m: Message):
+    if m.from_user.id != OWNER_ID: return await m.answer("Доступно только владельцу.")
+    if not os.path.exists(TRADES_CSV): return await m.answer("Пока нет закрытых сделок.")
+    rows = list(csv.DictReader(open(TRADES_CSV,encoding="utf-8")))[-10:]
+    if not rows: return await m.answer("Пусто.")
+    txt = "Последние 10 закрытий:\n"
+    for r in rows:
+        txt += (f"{r['ts_close']}  {r['symbol']}  {r['side']}  {r['outcome']}  "
+                f"entry:{r['entry']} tp:{r['tp']} sl:{r['sl']} rr:{r['rr_ratio']}\n")
+    await m.answer("```\n"+txt+"```")
+
+@router.message(F.text.lower() == "тест")
+async def cmd_test(m: Message):
+    text = (
+        "🔥 BUY BTC-USD | 1m\n"
+        "✅ TP: **114999.9**\n"
+        "🟥 SL: **114111.1**\n"
+        "Entry: 114555.5  Spread≈350.0  ATR(14)≈45.0  Conf: 72%  Trend: UP"
+    )
+    await m.answer(text)
 
 # ===================== IO: Price Feeds (Yahoo/Stooq) =====================
 
@@ -189,7 +216,7 @@ def _df_from_yahoo_v8(payload: dict) -> pd.DataFrame:
             "Low":   q.get("low",   []),
             "Close": q.get("close", []),
         }, index=pd.to_datetime(ts, unit="s"))
-        df = df.replace([None, np.nan], method="ffill").replace([None, np.nan], method="bfill")
+        df = df.ffill().bfill()
         df = df.dropna()
         for col in ("Open","High","Low","Close"):
             df = df[df[col] > 0]
@@ -759,3 +786,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

@@ -15,13 +15,13 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V5.6 Ultra-Scalper (V5.1 base + speed + TP=0.5*ATR15 + RR hotfix)"
+VERSION = "V5.6 Ultra-Scalper (V5.1 base; speed 1s; TP from spread; RR hotfix; ATR only in logs)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
 LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw")
-OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))   # your Telegram user id
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))  # where signals go
+OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
 SYMBOLS = {
@@ -32,11 +32,14 @@ SYMBOLS = {
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
 SPREAD_BUFFER   = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
+
+# --- Ultra-Scalper tuning ---
+TP_DIST_MULT    = float(os.getenv("TP_DIST_MULT", "15.0"))  # TP distance = MULT × SPREAD_BUFFER
 CONF_MIN_IDEA   = 0.05
 CONF_MIN_TRADE  = 0.55
-RR_TRADE_MIN    = 0.20   # V5.6: was 1.00
+RR_TRADE_MIN    = 0.20   # was 1.00
 TP_MIN_TRADE    = {"NG": 0.005, "XAU": 0.005, "BTC": 50.0}
-RR_MIN_IDEA     = 0.20   # V5.6 HOTFIX: was 0.50
+RR_MIN_IDEA     = 0.20   # was 0.50
 FRESH_MULT      = 10.0
 
 SEND_IDEAS         = True
@@ -46,7 +49,7 @@ MAX_IDEAS_PER_HOUR = 20
 LONDON_HOURS = range(7, 15)   # UTC
 NY_HOURS     = range(12, 21)  # UTC
 
-POLL_SEC        = 1     # V5.6 speed patch: was 6
+POLL_SEC        = 1           # speed patch
 ALIVE_EVERY_SEC = 300
 BOOT_COOLDOWN_S = 30
 COOLDOWN_SEC    = 10
@@ -238,8 +241,7 @@ def _df_from_stooq_csv(text: str):
         if not text or "Date,Open,High,Low,Close" not in text:
             return pd.DataFrame()
         df = pd.read_csv(StringIO(text))
-        if not {"Open","High","Low","Close"}.is_subset(set(df.columns)):
-            pass
+        # оставляем как было, без лишних проверок
         return df.tail(1000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
@@ -258,7 +260,7 @@ async def _get_df_stooq_1m(session, stooq_code: str) -> pd.DataFrame:
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     now_ts = time.time()
     c = _prices_cache.get(symbol)
-    cache_ttl = 10.0
+    cache_ttl = 1.0  # speed: refresh ~each second
     if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
 
@@ -456,7 +458,7 @@ def format_signal(setup, buffer):
         f"RR≈{round(setup['rr'],2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
-# ===================== V5.6: ADAPTIVE SCALP TP (0.5 * ATR15) =====================
+# ===================== V5.6: TP от буфера (без ATR в трейд-логике) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
     if df1m is None or df1m.empty or len(df1m) < 200:
         return None
@@ -488,20 +490,17 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     else:
         sl = max(entry, hi15 + buf)
 
-    # === V5.6: TP = entry ± 0.5 * ATR(15) (адаптивный, близкий) ===
-    # используем ту же логику ATR, что и в alive_loop (ниже есть _atr_m15)
-    atr15 = _atr_m15(df1m)
-    tp_dist = 0.5 * max(float(atr15), 1e-9)
-    if side == "BUY":
-        tp = entry + tp_dist
-    else:
-        tp = entry - tp_dist
+    # V5.6: TP = entry ± (TP_DIST_MULT × SPREAD_BUFFER[symbol])
+    tp_dist = float(TP_DIST_MULT) * float(SPREAD_BUFFER.get(symbol, 0.0))
+    if tp_dist <= 0:
+        return None  # защитно
+    tp = entry + tp_dist if side == "BUY" else entry - tp_dist
 
     rr     = abs(tp - entry) / max(abs(entry - sl), 1e-9)
     tp_abs = abs(tp - entry)
     tp_min = TP_MIN_TRADE.get(symbol, 0.0)
 
-    # ===== 7-факторный скоринг — БЕЗ ИЗМЕНЕНИЙ (как в V5.1) =====
+    # ===== 7-факторный скоринг — без изменений =====
     score = 0
     base_ok = (fvg_ok or choch_ok)
     score += 40 if base_ok else 10
@@ -589,7 +588,7 @@ def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
     global last_seen_idx, last_signal_idx
 
-    # Auto mode: skip BTC in engine; trade only NG/XAU
+    # Auto mode: skip BTC in engine; trade only NG/XAU unless explicitly chosen
     if mode != "AUTO" and symbol not in (mode,):
         return
 
@@ -644,7 +643,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
     if not is_fresh_enough(symbol, entry, close_now):
         return
 
-    # IDEA: V5.6 hotfix RR>=0.20 (раньше 0.50)
+    # IDEA
     if conf >= CONF_MIN_IDEA and rr >= RR_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
@@ -652,7 +651,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
 
-    # TRADE: Conf≥0.55 и RR≥0.20, плюс базовая минимальная амплитуда TP (как было)
+    # TRADE
     if (conf >= CONF_MIN_TRADE) and (rr >= RR_TRADE_MIN) and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
         trade[symbol] = {
@@ -673,7 +672,6 @@ async def engine_loop():
                 if time.time() - dxy_ts > 25:
                     dxy_df = await get_dxy_df(session)
                     dxy_ts = time.time()
-                # In AUTO we track both NG and XAU; in single-mode we track selected symbol.
                 for s in ("NG", "XAU"):
                     await handle_symbol(session, s, dxy_df)
                 await asyncio.sleep(POLL_SEC)
@@ -681,7 +679,7 @@ async def engine_loop():
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(2)
 
-# ===================== ALIVE LOOP =====================
+# ===================== ALIVE LOOP (ATR только для логов) =====================
 def _atr_m15(df: pd.DataFrame) -> float:
     d = _resample(df, 15)
     if d.empty: return 0.0

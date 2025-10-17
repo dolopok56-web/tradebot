@@ -118,7 +118,7 @@ _prices_cache = {}
 # ===================== TELEGRAM =====================
 
 router = Router()
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="None"))
 dp  = Dispatcher()
 dp.include_router(router)
 
@@ -786,4 +786,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

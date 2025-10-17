@@ -12,29 +12,28 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
 from aiogram.filters import Command
 
-# ===================== VERSION =====================
-VERSION = "V5.6 Ultra-Scalper (TP=0.5*ATR15, RR>=0.20 for Trade & Idea, 1s loop)"
+VERSION = "V5.6 Ultra-Scalper (TP=0.5*ATR15, RR>=0.20 trade+idea, 1s loop)"
 
-# ===================== TOKENS / OWNER =====================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
-LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw")
-OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
+# ===== TOKENS / OWNER (hardcoded as requested) =====
+MAIN_BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
+LOG_BOT_TOKEN  = "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw"
+OWNER_ID       = 6784470762
+TARGET_CHAT_ID = 6784470762
 
-# ===================== MARKETS =====================
+# ===== MARKETS =====
 SYMBOLS = {
-    "NG":  {"name": "NG=F",       "tf": "1m"},
-    "XAU": {"name": "XAUUSD=X",   "tf": "1m"},
+    "BTC": {"name": "BTC-USD",   "tf": "1m"},
+    "NG":  {"name": "NG=F",      "tf": "1m"},
+    "XAU": {"name": "XAUUSD=X",  "tf": "1m"},
 }
+SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
 
-SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20}
-
-# ===================== STRATEGY SETTINGS =====================
-CONF_MIN_IDEA   = 0.05
-CONF_MIN_TRADE  = 0.55
-RR_TRADE_MIN    = 0.20        # trade threshold
-RR_MIN_IDEA     = 0.20        # HOTFIX: idea threshold lowered
-FRESH_MULT      = 10.0
+# ===== STRATEGY =====
+CONF_MIN_IDEA  = 0.05
+CONF_MIN_TRADE = 0.55
+RR_TRADE_MIN   = 0.20
+RR_MIN_IDEA    = 0.20
+FRESH_MULT     = 10.0
 
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 90
@@ -52,7 +51,6 @@ HTTP_TIMEOUT   = 12
 YAHOO_RETRIES  = 4
 YAHOO_BACKOFF0 = 0.9
 YAHOO_JITTER   = 0.35
-
 ROBUST_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"),
@@ -61,19 +59,22 @@ ROBUST_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# ===================== STATE =====================
+# ===== STATE =====
 boot_ts = time.time()
-trade = {"NG": None, "XAU": None}
-cooldown_until = {"NG": 0.0, "XAU": 0.0}
-_last_idea_ts = {"NG": 0.0, "XAU": 0.0}
-_ideas_count_hour = {"NG": 0, "XAU": 0}
-_ideas_count_hour_ts = {"NG": 0.0, "XAU": 0.0}
-last_seen_idx = {"NG": -1, "XAU": -1}
-last_signal_idx = {"NG": -1, "XAU": -1}
+trade = {"NG": None, "XAU": None, "BTC": None}
+cooldown_until = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+last_candle_close_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+_last_idea_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+_ideas_count_hour = {"NG": 0, "XAU": 0, "BTC": 0}
+_ideas_count_hour_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+last_seen_idx = {"NG": -1, "XAU": -1, "BTC": -1}
+last_signal_idx = {"NG": -1, "XAU": -1, "BTC": -1}
 _prices_cache = {}
-mode = "AUTO"           # AUTO means process both NG and XAU
+state = {}
+mode = "AUTO"
+requested_mode = "AUTO"
 
-# ===================== TELEGRAM =====================
+# ===== TELEGRAM =====
 router = Router()
 bot_main = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
 bot_log  = Bot(LOG_BOT_TOKEN,  default=DefaultBotProperties(parse_mode=None))
@@ -81,95 +82,96 @@ dp = Dispatcher()
 dp.include_router(router)
 
 async def send_main(text: str):
-    try:
-        await bot_main.send_message(TARGET_CHAT_ID, text)
-    except Exception as e:
-        logging.error(f"send_main error: {e}")
+    try: await bot_main.send_message(TARGET_CHAT_ID, text)
+    except Exception as e: logging.error(f"send_main error: {e}")
 
 async def send_log(text: str):
-    try:
-        await bot_log.send_message(TARGET_CHAT_ID, text)
-    except Exception as e:
-        logging.error(f"send_log error: {e}")
+    try: await bot_log.send_message(TARGET_CHAT_ID, text)
+    except Exception as e: logging.error(f"send_log error: {e}")
 
-def title_of(sym: str) -> str:
-    return SYMBOLS[sym]["name"]
+def mode_title(m: str) -> str:
+    return {"BTC":"BITCOIN (BTC-USD)","NG":"NATGAS (NG=F)","XAU":"GOLD (XAUUSD)","AUTO":"NATGAS+GOLD (AUTO)"}.get(m,m)
+
+async def _request_mode(new_mode: str, m: Message | None = None):
+    global requested_mode, mode
+    requested_mode = new_mode
+    mode = new_mode
+    if m: await m.answer(f"✅ Режим {new_mode}: слежу за {mode_title(new_mode)}.")
 
 @router.message(Command("start"))
 async def cmd_start(m: Message):
-    await m.answer(f"✅ Bot is alive ({VERSION}). Type 'help' for commands.")
+    await m.answer(f"✅ Bot is alive ({VERSION}).\nНапиши 'команды' чтобы увидеть список.")
+    await m.answer(f"✅ Текущий режим: {mode} — {mode_title(mode)}.")
 
-@router.message(F.text.lower() == "help")
+@router.message(F.text.lower() == "команды")
 async def cmd_help(m: Message):
     await m.answer(
-        "Commands:\n"
-        "• /start — show status\n"
-        "• help — this list\n"
-        "• gas — focus NG only\n"
-        "• gold — focus XAU only\n"
-        "• auto — track both NG & XAU\n"
-        "• stop — cancel any open session and short cooldown\n"
-        "• status — diagnostics\n"
-        "• report — last 10 closed trades\n"
-        "• test — sample message\n"
+        "📋 Команды:\n"
+        "• /start — запуск\n"
+        "• команды — список\n"
+        "• биток / газ / золото / авто — выбор рынка\n"
+        "• стоп — стоп и короткий кулдаун\n"
+        "• статус — диагностика\n"
+        "• отчет — 10 последних закрытий\n"
+        "• тест — тестовый сигнал"
     )
 
-@router.message(F.text.lower() == "gas")
-async def set_ng(m: Message):
-    global mode; mode = "NG"
-    await m.answer("Mode set: NG only.")
+@router.message(F.text.lower() == "биток")
+async def set_btc(m: Message): await _request_mode("BTC", m)
 
-@router.message(F.text.lower() == "gold")
-async def set_xau(m: Message):
-    global mode; mode = "XAU"
-    await m.answer("Mode set: XAU only.")
+@router.message(F.text.lower() == "газ")
+async def set_ng(m: Message):  await _request_mode("NG", m)
 
-@router.message(F.text.lower() == "auto")
-async def set_auto(m: Message):
-    global mode; mode = "AUTO"
-    await m.answer("Mode set: AUTO (NG + XAU).")
+@router.message(F.text.lower() == "золото")
+async def set_xau(m: Message): await _request_mode("XAU", m)
 
-@router.message(F.text.lower() == "stop")
+@router.message(F.text.lower() == "авто")
+async def set_auto(m: Message): await _request_mode("AUTO", m)
+
+@router.message(F.text.lower() == "стоп")
 async def cmd_stop(m: Message):
     now = time.time()
     for s in trade.keys():
         trade[s] = None
         cooldown_until[s] = now + 5
-    await m.answer("Stopped. No open session, short cooldown applied.")
+    await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
 
-@router.message(F.text.lower() == "status")
+@router.message(F.text.lower() == "статус")
 async def cmd_status(m: Message):
+    lines = [f"mode: {mode} (requested: {requested_mode})"]
     now = time.time()
-    lines = [f"mode: {mode}"]
-    for s in ("NG","XAU"):
+    for s in ["BTC","NG","XAU"]:
         opened = bool(trade[s])
-        cd = max(0, int(cooldown_until[s] - now))
-        lines.append(f"{title_of(s)}: open={opened} cooldown={cd}s")
-    await m.answer("```\n" + "\n".join(lines) + "\n```")
+        age = int(now - last_candle_close_ts[s]) if last_candle_close_ts[s] else -1
+        atrtxt = state.get(f"atr_{s}", "—")
+        nm = SYMBOLS[s]["name"]
+        cd = max(0, int(cooldown_until[s]-now))
+        lines.append(f"{nm}: open={opened}  cooldown={cd}  ATR≈{atrtxt}  last_close_age={age}s")
+    await m.answer("```\n"+ "\n".join(lines) + "\n```")
 
-@router.message(F.text.lower() == "report")
+@router.message(F.text.lower() == "отчет")
 async def cmd_report(m: Message):
     if not os.path.exists(TRADES_CSV):
-        return await m.answer("No closed trades yet.")
-    rows = list(csv.DictReader(open(TRADES_CSV, encoding="utf-8")))[-10:]
+        return await m.answer("Пока нет закрытых сделок.")
+    rows = list(csv.DictReader(open(TRADES_CSV,encoding="utf-8")))[-10:]
     if not rows:
-        return await m.answer("Empty.")
-    txt = "Last 10 closures:\n"
+        return await m.answer("Пусто.")
+    txt = "Последние 10 закрытий:\n"
     for r in rows:
         txt += (f"{r['ts_close']}  {r['symbol']}  {r['side']}  {r['outcome']}  "
                 f"entry:{r['entry']} tp:{r['tp']} sl:{r['sl']} rr:{r['rr_ratio']}\n")
     await m.answer("```\n"+txt+"```")
 
-@router.message(F.text.lower() == "test")
+@router.message(F.text.lower() == "тест")
 async def cmd_test(m: Message):
     await m.answer(
         "🔥 BUY NG=F | 1m\n"
-        "✅ TP: **3.0000**\n"
+        "✅ TP: **2.9990**\n"
         "🟥 SL: **2.9550**\n"
         "Entry: 2.9800  Spread≈0.0020  RR≈0.35  Conf: 60%"
     )
 
-# ===================== PRICE FETCH (Yahoo) =====================
+# ===== PRICE FEEDS (Yahoo) =====
 async def _yahoo_json(session: aiohttp.ClientSession, url: str) -> dict:
     backoff = YAHOO_BACKOFF0
     for _ in range(YAHOO_RETRIES):
@@ -192,8 +194,7 @@ def _df_from_yahoo_v8(payload: dict) -> pd.DataFrame:
         r = payload.get("chart", {}).get("result", [])[0]
         ts = r.get("timestamp", [])
         q  = r.get("indicators", {}).get("quote", [])[0]
-        if not ts or not q:
-            return pd.DataFrame()
+        if not ts or not q: return pd.DataFrame()
         df = pd.DataFrame({
             "Open":  q.get("open",  []),
             "High":  q.get("high",  []),
@@ -213,18 +214,26 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     if c and (now_ts - c["ts"] < 10.0) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
 
-    tickers = {"NG": ["NG%3DF"], "XAU": ["XAUUSD%3DX", "GC%3DF"]}
+    tickers = {
+        "NG":  ["NG%3DF"],
+        "XAU": ["XAUUSD%3DX","GC%3DF"],
+        "BTC": ["BTC-USD"],
+    }
     for t in tickers.get(symbol, []):
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"
         df = _df_from_yahoo_v8(await _yahoo_json(session, url))
         if not df.empty:
+            last_candle_close_ts[symbol] = time.time()
             _prices_cache[symbol] = {"ts": now_ts, "df": df}
             return df
     return pd.DataFrame()
 
-# ===================== SMC TOOLS =====================
+# ===== SMC UTILS =====
 def rnd(sym: str, x: float) -> float:
-    return round(float(x), 4) if sym == "NG" else round(float(x), 2)
+    if sym == "NG": return round(float(x), 4)
+    if sym == "XAU": return round(float(x), 2)
+    if sym == "BTC": return round(float(x), 2)
+    return round(float(x), 4)
 
 def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
@@ -257,10 +266,9 @@ def _atr_m(df: pd.DataFrame, minutes: int = 15, period: int = 14) -> float:
 def dynamic_buffer(symbol: str) -> float:
     return SPREAD_BUFFER.get(symbol, 0.0)
 
-# ===================== SIGNAL BUILDER (V5.6) =====================
+# ===== SIGNAL BUILDER (V5.6: TP=0.5*ATR15, RR>=0.20) =====
 def build_setup(df1m: pd.DataFrame, symbol: str):
     if df1m is None or df1m.empty or len(df1m) < 200: return None
-
     df15 = _resample(df1m, 15)
     if df15.empty: return None
 
@@ -269,39 +277,32 @@ def build_setup(df1m: pd.DataFrame, symbol: str):
     lo15  = _swing_low(df15, 20)
     buf   = dynamic_buffer(symbol)
 
-    # Bias: mid of last 20x15m range
-    bias = "UP" if entry >= (lo15 + (hi15 - lo15) / 2.0) else "DOWN"
+    bias = "UP" if entry >= (lo15 + (hi15 - lo15)/2.0) else "DOWN"
     side = "BUY" if bias == "UP" else "SELL"
 
-    # SL on structure with buffer
     sl = (lo15 - buf) if side == "BUY" else (hi15 + buf)
 
-    # Scalping TP: 0.5 * ATR(15)
     atr15 = _atr_m(df1m, 15, 14)
     tp_dist = 0.5 * max(atr15, 1e-9)
     tp = entry + tp_dist if side == "BUY" else entry - tp_dist
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    conf = 0.60  # lightweight surrogate confidence to keep flow
 
-    # Simple confidence surrogate to keep flow (can be replaced with full SMC scoring)
-    conf = 0.60
-
-    return {
-        "symbol": symbol, "side": side, "entry": entry,
-        "tp": tp, "sl": sl, "rr": rr, "conf": conf, "tf": "1m"
-    }
+    return {"symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl,
+            "rr": rr, "conf": conf, "tf": "1m"}
 
 def format_signal(setup, buffer):
     sym=setup["symbol"]; side=setup["side"]
     return (
-        f"🔥 {side} {title_of(sym)} | {setup['tf']}\n"
+        f"🔥 {side} {SYMBOLS[sym]['name']} | {setup['tf']}\n"
         f"✅ TP: **{rnd(sym,setup['tp'])}**\n"
         f"🟥 SL: **{rnd(sym,setup['sl'])}**\n"
         f"Entry: {rnd(sym,setup['entry'])}  Spread≈{rnd(sym,buffer)}  "
         f"RR≈{round(setup['rr'],2)}  Conf: {int(setup['conf']*100)}%"
     )
 
-# ===================== EXECUTION / LOGGING =====================
+# ===== EXECUTION / LOGGING =====
 def append_trade(row):
     newf = not os.path.exists(TRADES_CSV)
     with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
@@ -310,7 +311,7 @@ def append_trade(row):
         w.writerow(row)
 
 async def notify_outcome(symbol: str, outcome: str, price: float):
-    name = title_of(symbol); p = rnd(symbol, price)
+    name = SYMBOLS[symbol]["name"]; p = rnd(symbol, price)
     text = f"✅ TP hit on {name} @ {p}" if outcome=="TP" else f"🟥 SL hit on {name} @ {p}"
     await send_main(text)
 
@@ -330,7 +331,7 @@ def finish_trade(symbol: str, outcome: str, price_now: float):
         "life_sec": int(time.time()-sess.get("opened_at", time.time())),
     })
 
-# ===================== ENGINE =====================
+# ===== ENGINE =====
 def _reset_hour_if_needed(sym: str):
     now = time.time()
     start = _ideas_count_hour_ts.get(sym, 0.0) or 0.0
@@ -396,7 +397,6 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
 
     if not is_fresh_enough(symbol, entry, close_now): return
 
-    # IDEA (with RR>=0.20 hotfix)
     if conf >= CONF_MIN_IDEA and rr >= RR_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
@@ -404,7 +404,6 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
 
-    # TRADE (Conf≥0.55 and RR≥0.20)
     if (conf >= CONF_MIN_TRADE) and (rr >= RR_TRADE_MIN):
         await send_main(format_signal(setup, buffer))
         trade[symbol] = {
@@ -420,24 +419,42 @@ async def engine_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                if mode in ("AUTO", "NG"):
-                    await handle_symbol(session, "NG")
-                if mode in ("AUTO", "XAU"):
-                    await handle_symbol(session, "XAU")
+                if mode in ("AUTO","BTC"):   await handle_symbol(session, "BTC")
+                if mode in ("AUTO","NG"):    await handle_symbol(session, "NG")
+                if mode in ("AUTO","XAU"):   await handle_symbol(session, "XAU")
                 await asyncio.sleep(POLL_SEC)
             except Exception as e:
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(0.5)
 
+def _atr_m15_snapshot(val_df: pd.DataFrame) -> float:
+    d = _resample(val_df, 15)
+    if d.empty: return 0.0
+    tr = (d["High"] - d["Low"]).rolling(14).mean()
+    x = tr.iloc[-1] if not tr.empty else 0.0
+    return float(x) if pd.notna(x) else 0.0
+
 async def alive_loop():
     while True:
         try:
-            await send_log("[ALIVE] V5.6 running. Engine OK.")
+            async with aiohttp.ClientSession() as s:
+                df_btc = await get_df(s, "BTC")
+                df_ng  = await get_df(s, "NG")
+                df_xau = await get_df(s, "XAU")
+            c_btc = float(df_btc["Close"].iloc[-1]) if not df_btc.empty else 0.0
+            c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty else 0.0
+            c_xau = float(df_xau["Close"].iloc[-1]) if not df_xau.empty else 0.0
+            state["atr_BTC"] = rnd("BTC", _atr_m15_snapshot(df_btc)) if not df_btc.empty else "—"
+            state["atr_NG"]  = rnd("NG",  _atr_m15_snapshot(df_ng))  if not df_ng.empty else "—"
+            state["atr_XAU"] = rnd("XAU", _atr_m15_snapshot(df_xau)) if not df_xau.empty else "—"
+            msg = (f"[ALIVE] BTC:{rnd('BTC',c_btc)} ATR15:{state['atr_BTC']} | "
+                   f"NG:{rnd('NG',c_ng)} ATR15:{state['atr_NG']} | "
+                   f"XAU:{rnd('XAU',c_xau)} ATR15:{state['atr_XAU']}. OK.")
+            await send_log(msg)
         except Exception as e:
             await send_log(f"[ALIVE ERROR] {e}")
         await asyncio.sleep(ALIVE_EVERY_SEC)
 
-# ===================== MAIN =====================
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     asyncio.create_task(engine_loop())

@@ -671,15 +671,23 @@ async def engine_loop():
         dxy_ts = 0.0
         while True:
             try:
+                # DXY обновляем иногда (для XAU; для BTC это не мешает)
                 if time.time() - dxy_ts > 25:
                     dxy_df = await get_dxy_df(session)
                     dxy_ts = time.time()
-                for s in ("NG", "XAU"):
+
+                # ⬇️ ВАЖНО: тут решаем, какие символы обрабатывать
+                # AUTO = только NG и XAU; ручной режим = ТОЛЬКО выбранный (включая BTC)
+                symbols_to_run = ("NG", "XAU") if mode == "AUTO" else (mode,)
+
+                for s in symbols_to_run:
                     await handle_symbol(session, s, dxy_df)
+
                 await asyncio.sleep(POLL_SEC)
             except Exception as e:
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(2)
+
 
 # ===================== ALIVE LOOP (ATR только для логов) =====================
 def _atr_m15(df: pd.DataFrame) -> float:
@@ -694,17 +702,30 @@ async def alive_loop():
             async with aiohttp.ClientSession() as s:
                 df_ng  = await get_df(s, "NG")
                 df_xau = await get_df(s, "XAU")
-            c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty else 0.0
+                df_btc = await get_df(s, "BTC")  # ⬅️ добавили
+
+            c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty  else 0.0
             c_xau = float(df_xau["Close"].iloc[-1]) if not df_xau.empty else 0.0
-            a_ng  = _atr_m15(df_ng)  if not df_ng.empty else 0.0
+            c_btc = float(df_btc["Close"].iloc[-1]) if not df_btc.empty else 0.0  # ⬅️
+            a_ng  = _atr_m15(df_ng)  if not df_ng.empty  else 0.0
             a_xau = _atr_m15(df_xau) if not df_xau.empty else 0.0
+            a_btc = _atr_m15(df_btc) if not df_btc.empty else 0.0             # ⬅️
+
             state["atr_NG"]  = rnd("NG", a_ng)
             state["atr_XAU"] = rnd("XAU", a_xau)
-            msg = f"[ALIVE] NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} | XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)}. Status: OK."
+            state["atr_BTC"] = rnd("BTC", a_btc)                               # ⬅️
+
+            msg = (
+                f"[ALIVE] "
+                f"NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} | "
+                f"XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)} | "
+                f"BTC: {rnd('BTC',c_btc)}, ATR15: {rnd('BTC',a_btc)}. Status: OK."
+            )
             await send_log(msg)
         except Exception as e:
             await send_log(f"[ALIVE ERROR] {e}")
         await asyncio.sleep(ALIVE_EVERY_SEC)
+
 
 # ===================== MAIN =====================
 async def main():
@@ -718,4 +739,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

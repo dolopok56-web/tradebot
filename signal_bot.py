@@ -15,7 +15,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V5.6 Ultra-Scalper (V5.1 base; speed 1s; TP from spread; RR hotfix; ATR only in logs)"
+VERSION = "V5.8 Ultra-Scalper (V5.1 base + speed 1s + TP=0.5*ATR15 + 3m idea cooldown + BTC only on demand + no RR filters)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -25,31 +25,35 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
 SYMBOLS = {
-    "BTC": {"name": "BTC-USD",    "tf": "1m"},
-    "NG":  {"name": "NG=F",       "tf": "1m"},
-    "XAU": {"name": "XAUUSD=X",   "tf": "1m"},
+    "BTC": {"name": "BTC-USD",   "tf": "1m"},
+    "NG":  {"name": "NG=F",      "tf": "1m"},
+    "XAU": {"name": "XAUUSD=X",  "tf": "1m"},
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
 SPREAD_BUFFER   = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
-
-# --- Ultra-Scalper tuning ---
-TP_DIST_MULT    = float(os.getenv("TP_DIST_MULT", "15.0"))  # TP distance = MULT × SPREAD_BUFFER
 CONF_MIN_IDEA   = 0.05
 CONF_MIN_TRADE  = 0.55
-RR_TRADE_MIN    = 0.20   # was 1.00
+
+# V5.8: RR фильтры отключены (оставлены как значения, но НЕ используются)
+RR_TRADE_MIN    = 0.00
 TP_MIN_TRADE    = {"NG": 0.005, "XAU": 0.005, "BTC": 50.0}
-RR_MIN_IDEA     = 0.20   # was 0.50
+RR_MIN_IDEA     = 0.00
+
+# фильтр свежести (оставляем)
 FRESH_MULT      = 10.0
 
+# Антиспам ИДЕЙ (V5.8: 3 минуты кулдаун)
 SEND_IDEAS         = True
-IDEA_COOLDOWN_SEC  = 90
+IDEA_COOLDOWN_SEC  = 180
 MAX_IDEAS_PER_HOUR = 20
 
-LONDON_HOURS = range(7, 15)   # UTC
-NY_HOURS     = range(12, 21)  # UTC
+# Сессии (UTC)
+LONDON_HOURS = range(7, 15)
+NY_HOURS     = range(12, 21)
 
-POLL_SEC        = 1           # speed patch
+# Скорость и интервалы
+POLL_SEC        = 1          # V5.8 скорость
 ALIVE_EVERY_SEC = 300
 BOOT_COOLDOWN_S = 30
 COOLDOWN_SEC    = 10
@@ -86,7 +90,7 @@ last_signal_idx = {"NG": -1, "XAU": -1, "BTC": -1}
 
 _prices_cache = {}
 state = {}
-mode = "AUTO"
+mode = "AUTO"          # AUTO: NG+XAU; BTC — только вручную по команде
 requested_mode = "AUTO"
 
 # ===================== TELEGRAM =====================
@@ -241,7 +245,9 @@ def _df_from_stooq_csv(text: str):
         if not text or "Date,Open,High,Low,Close" not in text:
             return pd.DataFrame()
         df = pd.read_csv(StringIO(text))
-        # оставляем как было, без лишних проверок
+        # fix опечатка: issubset (иначе мог падать)
+        if not {"Open","High","Low","Close"}.issubset(set(df.columns)):
+            return pd.DataFrame()
         return df.tail(1000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
@@ -260,7 +266,7 @@ async def _get_df_stooq_1m(session, stooq_code: str) -> pd.DataFrame:
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     now_ts = time.time()
     c = _prices_cache.get(symbol)
-    cache_ttl = 1.0  # speed: refresh ~each second
+    cache_ttl = 1.0  # V5.8 — быстрый кеш
     if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
 
@@ -295,14 +301,12 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
     if symbol == "BTC":
         for t in ("BTC-USD",):
-            df = _df_from_yahoo_v8(await _yahoo_json(
-                session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"
-            ))
+            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
             if not df.empty:
                 last_candle_close_ts["BTC"] = time.time()
-                _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed": "yahoo"}
+                _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
                 return df
-    return pd.DataFrame()
+        return pd.DataFrame()
 
     return pd.DataFrame()
 
@@ -460,10 +464,12 @@ def format_signal(setup, buffer):
         f"RR≈{round(setup['rr'],2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
-# ===================== V5.6: TP от буфера (без ATR в трейд-логике) =====================
+# ===================== BUILD SETUP (V5.8 изменения внутри) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
     if df1m is None or df1m.empty or len(df1m) < 200:
         return None
+
+    # MTF
     df5   = _resample(df1m, 5)
     df15  = _resample(df1m, 15)
     df60  = _resample(df1m, 60)
@@ -471,11 +477,15 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     if df5.empty or df15.empty or df60.empty or df240.empty: return None
 
     bias = bias_bos_higher(df60, df240)
+
+    # базовые «глаза»: максимально мягкие
     fvg_ok, fvg_dir, fvg_top, fvg_bot, fvg_w = fvg_last_soft(df15, lookback=20, use_bodies=True, min_abs=0.0, min_rel_to_avg=0.0)
     choch_ok = choch_soft(df5, "UP" if bias=="UP" else "DOWN", swing_lookback=8, confirm_break=False)
 
+    # стоп-хант
     sweep15, sweep_dir15 = had_liquidity_sweep(df15, lookback=20)
 
+    # сторона
     side = "BUY" if bias=="UP" else "SELL"
     if sweep15:
         if sweep_dir15=="UP": side="BUY"
@@ -486,23 +496,28 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     lo15  = _swing_low(df15, 20)
     buf   = dynamic_buffer(symbol)
 
-    # SL по структуре + буфер (как в V5.1)
+    # SL как в V5.1: структура + буфер
     if side == "BUY":
         sl = min(entry, lo15 - buf)
     else:
         sl = max(entry, hi15 + buf)
 
-    # V5.6: TP = entry ± (TP_DIST_MULT × SPREAD_BUFFER[symbol])
-    tp_dist = float(TP_DIST_MULT) * float(SPREAD_BUFFER.get(symbol, 0.0))
-    if tp_dist <= 0:
-        return None  # защитно
+    # === V5.8: TP = entry ± 0.5 * ATR(15) === (локально считаем ATR15)
+    d15 = _resample(df1m, 15)
+    if d15.empty or len(d15) < 20:
+        return None
+    tr = (d15["High"] - d15["Low"]).rolling(14).mean()
+    atr15 = float(tr.iloc[-1]) if not tr.empty and pd.notna(tr.iloc[-1]) else 0.0
+    if atr15 <= 0:
+        return None
+    tp_dist = 0.5 * atr15
     tp = entry + tp_dist if side == "BUY" else entry - tp_dist
 
     rr     = abs(tp - entry) / max(abs(entry - sl), 1e-9)
     tp_abs = abs(tp - entry)
     tp_min = TP_MIN_TRADE.get(symbol, 0.0)
 
-    # ===== 7-факторный скоринг — без изменений =====
+    # ===== скоринг (как было) =====
     score = 0
     base_ok = (fvg_ok or choch_ok)
     score += 40 if base_ok else 10
@@ -590,7 +605,7 @@ def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
     global last_seen_idx, last_signal_idx
 
-    # Auto mode: skip BTC in engine; trade only NG/XAU unless explicitly chosen
+    # Режим: если не AUTO, обрабатываем только выбранный символ (в т.ч. BTC)
     if mode != "AUTO" and symbol not in (mode,):
         return
 
@@ -604,6 +619,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         return
     last_seen_idx[symbol] = closed_idx
 
+    # сопровождение открытой сделки
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))
@@ -624,10 +640,13 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
                 return
         return
 
+    # глобальные кулдауны
     if time.time() - boot_ts < BOOT_COOLDOWN_S: return
     if time.time() < cooldown_until[symbol]:   return
 
+    # DXY bias (только для золота)
     dxy_bias = dxy_bias_from_df(dxy_df) if symbol=="XAU" and dxy_df is not None and not dxy_df.empty else None
+
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"], dxy_bias=dxy_bias)
     if not setup:
         return
@@ -638,23 +657,22 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
 
     buffer    = dynamic_buffer(symbol)
     conf      = float(setup["conf"])
-    rr        = float(setup["rr"])
     close_now = float(df["Close"].iloc[-1])
     entry     = float(setup["entry"])
 
     if not is_fresh_enough(symbol, entry, close_now):
         return
 
-    # IDEA
-    if conf >= CONF_MIN_IDEA and rr >= RR_MIN_IDEA and can_send_idea(symbol):
+    # IDEA (V5.8: без RR-фильтра)
+    if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
         _ideas_count_hour[symbol] = _ideas_count_hour.get(symbol, 0) + 1
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
 
-    # TRADE
-    if (conf >= CONF_MIN_TRADE) and (rr >= RR_TRADE_MIN) and (setup["tp_abs"] >= setup["tp_min"]):
+    # TRADE (V5.8: RR-фильтр удалён; оставлен порог по Conf и минимальная амплитуда TP)
+    if conf >= CONF_MIN_TRADE and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
         trade[symbol] = {
             "side": setup["side"],
@@ -671,25 +689,22 @@ async def engine_loop():
         dxy_ts = 0.0
         while True:
             try:
-                # DXY обновляем иногда (для XAU; для BTC это не мешает)
+                # DXY обновляем иногда (для XAU)
                 if time.time() - dxy_ts > 25:
                     dxy_df = await get_dxy_df(session)
                     dxy_ts = time.time()
 
-                # ⬇️ ВАЖНО: тут решаем, какие символы обрабатывать
-                # AUTO = только NG и XAU; ручной режим = ТОЛЬКО выбранный (включая BTC)
-                symbols_to_run = ("NG", "XAU") if mode == "AUTO" else (mode,)
+                # V5.8: AUTO = NG+XAU; BTC торгуется ТОЛЬКО при выборе режима "биток"
+                symbols_to_run = ("NG","XAU") if mode == "AUTO" else (mode,)
 
                 for s in symbols_to_run:
                     await handle_symbol(session, s, dxy_df)
-
                 await asyncio.sleep(POLL_SEC)
             except Exception as e:
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(2)
 
-
-# ===================== ALIVE LOOP (ATR только для логов) =====================
+# ===================== ALIVE LOOP =====================
 def _atr_m15(df: pd.DataFrame) -> float:
     d = _resample(df, 15)
     if d.empty: return 0.0
@@ -702,18 +717,19 @@ async def alive_loop():
             async with aiohttp.ClientSession() as s:
                 df_ng  = await get_df(s, "NG")
                 df_xau = await get_df(s, "XAU")
-                df_btc = await get_df(s, "BTC")  # ⬅️ добавили
+                df_btc = await get_df(s, "BTC")
 
-            c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty  else 0.0
+            c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty else 0.0
             c_xau = float(df_xau["Close"].iloc[-1]) if not df_xau.empty else 0.0
-            c_btc = float(df_btc["Close"].iloc[-1]) if not df_btc.empty else 0.0  # ⬅️
-            a_ng  = _atr_m15(df_ng)  if not df_ng.empty  else 0.0
+            c_btc = float(df_btc["Close"].iloc[-1]) if not df_btc.empty else 0.0
+
+            a_ng  = _atr_m15(df_ng)  if not df_ng.empty else 0.0
             a_xau = _atr_m15(df_xau) if not df_xau.empty else 0.0
-            a_btc = _atr_m15(df_btc) if not df_btc.empty else 0.0             # ⬅️
+            a_btc = _atr_m15(df_btc) if not df_btc.empty else 0.0
 
             state["atr_NG"]  = rnd("NG", a_ng)
             state["atr_XAU"] = rnd("XAU", a_xau)
-            state["atr_BTC"] = rnd("BTC", a_btc)                               # ⬅️
+            state["atr_BTC"] = rnd("BTC", a_btc)
 
             msg = (
                 f"[ALIVE] "
@@ -725,7 +741,6 @@ async def alive_loop():
         except Exception as e:
             await send_log(f"[ALIVE ERROR] {e}")
         await asyncio.sleep(ALIVE_EVERY_SEC)
-
 
 # ===================== MAIN =====================
 async def main():
@@ -739,5 +754,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-
-

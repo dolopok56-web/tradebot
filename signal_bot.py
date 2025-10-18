@@ -295,12 +295,14 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
     if symbol == "BTC":
         for t in ("BTC-USD",):
-            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
+            df = _df_from_yahoo_v8(await _yahoo_json(
+                session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"
+            ))
             if not df.empty:
                 last_candle_close_ts["BTC"] = time.time()
-                _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
+                _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed": "yahoo"}
                 return df
-        return pd.DataFrame()
+    return pd.DataFrame()
 
     return pd.DataFrame()
 
@@ -716,3 +718,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

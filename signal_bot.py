@@ -32,6 +32,15 @@ SYMBOLS = {
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
+# ==== Память уровней (сколько истории смотреть) ====
+# 5m: 48 часов (2 суток) истории -> 48*60/5 = 576 баров
+# 15m: 7 суток истории -> 7*24*60/15 = 672 баров
+MEMORY_HOURS_5M  = 48
+MEMORY_DAYS_15M  = 7
+
+LOOKBACK_5M  = int(MEMORY_HOURS_5M * 60 / 5)
+LOOKBACK_15M = int(MEMORY_DAYS_15M * 24 * 60 / 15)
+
 # спред-буферы (для SL и компенсации в TP)
 SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
 
@@ -512,8 +521,8 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
 
     # TP: ближайший значимый уровень (NO-ATR) + компенсация спреда
     if side == "BUY":
-        lvl5  = nearest_level_above(df5,  entry,  36)
-        lvl15 = nearest_level_above(df15, entry,  36)
+        lvl5  = nearest_level_above(df5,  entry,  LOOKBACK_5M)
+        lvl15 = nearest_level_above(df15, entry,  LOOKBACK_15M)
         if (lvl5 is not None) and (lvl15 is not None):
             target = min(lvl5, lvl15)
         else:
@@ -522,14 +531,14 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
             target = max(entry + max(entry - sl, 1e-9)*0.8, entry + TP_MIN_ABS.get(symbol,0.0))
         tp = target + buf  # компенсация спреда BUY
     else:
-        lvl5  = nearest_level_below(df5,  entry,  36)
-        lvl15 = nearest_level_below(df15, entry,  36)
+        lvl5  = nearest_level_below(df5,  entry,  LOOKBACK_5M)
+        lvl15 = nearest_level_below(df15, entry,  LOOKBACK_15M)
         if (lvl5 is not None) and (lvl15 is not None):
             target = max(lvl5, lvl15)
         else:
             target = lvl5 if lvl5 is not None else lvl15
         if (target is None) or (target >= entry):
-            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol,0.0))
+            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - .get(symbol,0.0))
         tp = target - buf  # компенсация спреда SELL
 
     tp_abs = abs(tp - entry)
@@ -759,3 +768,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

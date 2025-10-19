@@ -538,7 +538,7 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
         else:
             target = lvl5 if lvl5 is not None else lvl15
         if (target is None) or (target >= entry):
-            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - .get(symbol,0.0))
+            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol, 0.0))
         tp = target - buf  # компенсация спреда SELL
 
     tp_abs = abs(tp - entry)
@@ -768,4 +768,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, json, csv, logging, asyncio, random, math
+import os, time, json, csv, logging, asyncio, random
 from datetime import datetime
 from copy import deepcopy
 
@@ -15,7 +15,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V7.2 Human-Like Analyst (MTF 1m→1D, structural TP/SL, reasons, no auto-trade, ATR only in logs)"
+VERSION = "V7.0 Human-Trader (SMC/MTF, no-ATR logic, structure TP/SL, 1s speed, BTC manual)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -24,39 +24,44 @@ OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
+# tf в подписи сигнала; сами данные берём 1m и ресемплим
 SYMBOLS = {
-    "BTC": {"name": "BTC-USD",   "tf": "1m"},
-    "NG":  {"name": "NG=F",      "tf": "1m"},
-    "XAU": {"name": "XAUUSD=X",  "tf": "1m"},
+    "BTC": {"name": "BTC-USD",   "tf": "5m"},   # BTC включаешь вручную /биток
+    "NG":  {"name": "NATGAS (NG=F)","tf": "1m"},
+    "XAU": {"name": "GOLD (XAUUSD=X)","tf": "1m"},
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
-# Спред/буферы (используются для отступа от уровней, НЕ для расчёта TP по ATR)
-SPREAD_BUFFER   = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}    # минимальный отступ/компенсация
-TP_EXTRA_BUFFER = {"NG": 0.0100, "XAU": 0.30, "BTC": 15.0}   # минимальный смысловой ход поверх спреда
-SL_MIN_GAP      = {"NG": 0.0040, "XAU": 0.25, "BTC": 12.0}   # не ставить сверхблизко к входу
+# чистые спред-буферы (для SL и TP компенсации)
+SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
 
-# Конф/скоринг
-CONF_MIN_IDEA   = 0.25   # идея
-CONF_MIN_TRADE  = 0.55   # “боевой” сигнал (по сути — сильная идея). Торговли всё равно нет.
-RR_TRADE_MIN    = 1.20   # ориентир: не сигналим мусор
-RR_MIN_IDEA     = 1.00
+# минимальная реальная дистанция TP (чтобы цель не была микроскопической)
+TP_MIN_ABS = {"NG": 0.0100, "XAU": 0.80, "BTC": 25.0}
 
-# Антиспам
+# требования по уверенности (BTC можешь поднять до 0.70 при желании)
+CONF_MIN_TRADE = {"NG": 0.50, "XAU": 0.55, "BTC": 0.55}
+CONF_MIN_IDEA  = 0.05
+
+# RR-фильтров нет (используем 0 просто для отображения)
+RR_TRADE_MIN = 0.0
+RR_MIN_IDEA  = 0.0
+
+# антиспам идей отключён (идея = 0 кулдаун); новый сигнал только без открытой сделки
 SEND_IDEAS         = True
-IDEA_COOLDOWN_SEC  = 180
-MAX_IDEAS_PER_HOUR = 20
+IDEA_COOLDOWN_SEC  = 0
+MAX_IDEAS_PER_HOUR = 60
 
-# Сессии (только как мягкий бонус к уверенности)
-LONDON_HOURS = range(7, 15)   # UTC
-NY_HOURS     = range(12, 21)  # UTC
+# торговые окна — просто как маленький бонус к скору
+LONDON_HOURS = range(7, 15)
+NY_HOURS     = range(12, 21)
 
-# Скорость
+# скорость и интервалы
 POLL_SEC        = 1
 ALIVE_EVERY_SEC = 300
-BOOT_COOLDOWN_S = 15
+BOOT_COOLDOWN_S = 20
+COOLDOWN_SEC    = 7
 
-TRADES_CSV = "gv_trades.csv"  # остаётся на будущее (лог закрытий если когда-то включишь автоторг)
+TRADES_CSV = "gv_trades.csv"
 
 HTTP_TIMEOUT   = 12
 YAHOO_RETRIES  = 4
@@ -74,13 +79,20 @@ ROBUST_HEADERS = {
 # ===================== STATE =====================
 boot_ts = time.time()
 
-# мы НЕ открываем сделки автоматически. Ниже — только защита от повторов.
-_last_signal_idx = {"NG": -1, "XAU": -1, "BTC": -1}
-_last_signal_fingerprint = {"NG": "", "XAU": "", "BTC": ""}
+trade = {"NG": None, "XAU": None, "BTC": None}
+cooldown_until = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+last_candle_close_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+
+_last_idea_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+_ideas_count_hour = {"NG": 0, "XAU": 0, "BTC": 0}
+_ideas_count_hour_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+
+last_seen_idx   = {"NG": -1, "XAU": -1, "BTC": -1}
+last_signal_idx = {"NG": -1, "XAU": -1, "BTC": -1}
 
 _prices_cache = {}
 state = {}
-mode = "AUTO"            # AUTO: NG+XAU; BTC — по команде “биток”
+mode = "AUTO"          # AUTO: NG + XAU; BTC — вручную
 requested_mode = "AUTO"
 
 # ===================== TELEGRAM =====================
@@ -105,7 +117,7 @@ async def send_log(text: str):
 def mode_title(m: str) -> str:
     return {"BTC": "BITCOIN (BTC-USD)",
             "NG": "NATGAS (NG=F)",
-            "XAU": "GOLD (XAUUSD)",
+            "XAU": "GOLD (XAUUSD=X)",
             "AUTO": "NATGAS+GOLD (AUTO)"} .get(m, m)
 
 async def _request_mode(new_mode: str, m: Message | None = None):
@@ -127,8 +139,10 @@ async def cmd_help(m: Message):
         "• /start — запуск\n"
         "• команды — список\n"
         "• биток / газ / золото / авто — выбор рынка\n"
+        "• стоп — стоп и короткий кулдаун\n"
         "• статус — диагностика\n"
-        "• тест — тестовый сигнал (пример формата)\n"
+        "• отчет — 10 последних закрытий (только владелец)\n"
+        "• тест — тестовый сигнал"
     )
 
 @router.message(F.text.lower() == "биток")
@@ -143,28 +157,50 @@ async def set_xau(m: Message): await _request_mode("XAU", m)
 @router.message(F.text.lower() == "авто")
 async def set_auto(m: Message): await _request_mode("AUTO", m)
 
+@router.message(F.text.lower() == "стоп")
+async def cmd_stop(m: Message):
+    now = time.time()
+    for s in trade.keys():
+        trade[s] = None
+        cooldown_until[s] = now + 5
+    await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
+
 @router.message(F.text.lower() == "статус")
 async def cmd_status(m: Message):
+    now = time.time()
     lines = [f"mode: {mode} (requested: {requested_mode})",
              f"alive: OK | idea_cooldown={IDEA_COOLDOWN_SEC}s | poll={POLL_SEC}s"]
     for s in ["BTC","NG","XAU"]:
+        opened = bool(trade[s])
+        age = int(now - last_candle_close_ts[s]) if last_candle_close_ts[s] else -1
         atrtxt = state.get(f"atr_{s}", "—")
-        lines.append(f"{SYMBOLS[s]['name']}: ATR15≈{atrtxt}")
+        nm = SYMBOLS[s]["name"]
+        cd = max(0, int(cooldown_until[s]-now))
+        lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s")
     await m.answer("```\n"+ "\n".join(lines) + "\n```")
+
+@router.message(F.text.lower() == "отчет")
+async def cmd_report(m: Message):
+    if m.from_user.id != OWNER_ID:
+        return await m.answer("Доступно только владельцу.")
+    if not os.path.exists(TRADES_CSV):
+        return await m.answer("Пока нет закрытых сделок.")
+    rows = list(csv.DictReader(open(TRADES_CSV,encoding="utf-8")))[-10:]
+    if not rows:
+        return await m.answer("Пусто.")
+    txt = "Последние 10 закрытий:\n"
+    for r in rows:
+        txt += (f"{r['ts_close']}  {r['symbol']}  {r['side']}  {r['outcome']}  "
+                f"entry:{r['entry']} tp:{r['tp']} sl:{r['sl']} rr:{r['rr_ratio']}\n")
+    await m.answer("```\n"+txt+"```")
 
 @router.message(F.text.lower() == "тест")
 async def cmd_test(m: Message):
     text = (
-        "🧠 IDEA (пример):\n"
-        "🔥 BUY NG=F | 1m\n"
-        "✅ TP: **2.9150**\n"
-        "🟥 SL: **2.9020**\n"
-        "Entry: 2.9080  SpreadBuf≈0.0020  RR≈1.6  Conf: 68%  Bias: UP\n"
-        "🧠 Почему:\n"
-        "• H1/H4 структура указывает вверх\n"
-        "• Забрали ликвидность на M15, быстрый возврат\n"
-        "• TP перед ближайшей ликвидностью, SL за локальным минимумом\n"
-        "• Хороший микро-импульс по 1m"
+        "🔥 BUY BTC-USD | 5m\n"
+        "✅ TP: **114999.9**\n"
+        "🟥 SL: **114111.1**\n"
+        "Entry: 114555.5  Spread≈5.0  Conf: 72%  Bias: UP"
     )
     await m.answer(text)
 
@@ -202,7 +238,7 @@ def _df_from_yahoo_v8(payload: dict) -> pd.DataFrame:
         df = df.ffill().bfill().dropna()
         for col in ("Open","High","Low","Close"):
             df = df[df[col] > 0]
-        return df.tail(1500).reset_index(drop=True)
+        return df.tail(1000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -214,7 +250,7 @@ def _df_from_stooq_csv(text: str):
         df = pd.read_csv(StringIO(text))
         if not {"Open","High","Low","Close"}.issubset(set(df.columns)):
             return pd.DataFrame()
-        return df.tail(1500).reset_index(drop=True)
+        return df.tail(1000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -240,10 +276,12 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
         for t in ("NG%3DF",):
             df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
             if not df.empty:
+                last_candle_close_ts["NG"] = time.time()
                 _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
                 return df
         df = await _get_df_stooq_1m(session, "ng.f")
         if not df.empty:
+            last_candle_close_ts["NG"] = time.time()
             _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"stooq"}
             return df
         return pd.DataFrame()
@@ -252,11 +290,13 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
         for t in ("XAUUSD%3DX", "GC%3DF"):
             df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
             if not df.empty:
+                last_candle_close_ts["XAU"] = time.time()
                 _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
                 return df
         for s in ("xauusd","gc.f"):
             df = await _get_df_stooq_1m(session, s)
             if not df.empty:
+                last_candle_close_ts["XAU"] = time.time()
                 _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed":"stooq"}
                 return df
         return pd.DataFrame()
@@ -265,6 +305,7 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
         for t in ("BTC-USD",):
             df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
             if not df.empty:
+                last_candle_close_ts["BTC"] = time.time()
                 _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
                 return df
         return pd.DataFrame()
@@ -278,7 +319,7 @@ async def get_dxy_df(session: aiohttp.ClientSession) -> pd.DataFrame:
             return df
     return pd.DataFrame()
 
-# ===================== UTILS / ANALYTICS =====================
+# ===================== SMC / MTF UTILS =====================
 def rnd(sym: str, x: float) -> float:
     if sym == "NG":  return round(float(x), 4)
     if sym == "XAU": return round(float(x), 2)
@@ -313,12 +354,10 @@ def _in_session_utc():
     h = pd.Timestamp.utcnow().hour
     return (h in LONDON_HOURS) or (h in NY_HOURS)
 
-def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True,
-                  min_abs: float = 0.0, min_rel_to_avg: float = 0.0):
+def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True):
     n = len(df)
     if n < 4:
         return False, "", 0.0, 0.0, 0.0
-    avg_rng = float((df["High"] - df["Low"]).tail(max(lookback, 12)).mean() or 0.0)
     for i in range(n-2, max(1, n - lookback) - 1, -1):
         if use_bodies:
             h2 = max(float(df["Open"].iloc[i-2]), float(df["Close"].iloc[i-2]))
@@ -329,15 +368,9 @@ def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True,
             h2 = float(df["High"].iloc[i-2]); l2 = float(df["Low"].iloc[i-2])
             h0 = float(df["High"].iloc[i]);   l0 = float(df["Low"].iloc[i])
         if l0 > h2:
-            top, bot = l0, h2
-            width = abs(top - bot)
-            if width >= min_abs and (min_rel_to_avg <= 0.0 or (avg_rng > 0 and width >= min_rel_to_avg * avg_rng)):
-                return True, "BULL", top, bot, width
+            return True, "BULL", l0, h2, abs(l0-h2)
         if h0 < l2:
-            top, bot = h2, l0
-            width = abs(top - bot)
-            if width >= min_abs and (min_rel_to_avg <= 0.0 or (avg_rng > 0 and width >= min_rel_to_avg * avg_rng)):
-                return True, "BEAR", top, bot, width
+            return True, "BEAR", h2, l0, abs(h2-l0)
     return False, "", 0.0, 0.0, 0.0
 
 def choch_soft(df: pd.DataFrame, want: str, swing_lookback: int = 8, confirm_break: bool = False):
@@ -353,19 +386,6 @@ def choch_soft(df: pd.DataFrame, want: str, swing_lookback: int = 8, confirm_bre
     else:
         return (c_now < local_low)  or (not confirm_break and c_prev < local_low)
 
-def bias_bos_higher(df60, df240) -> str:
-    if df60 is None or df60.empty or df240 is None or df240.empty: return "UP"
-    c1 = float(df60["Close"].iloc[-2])
-    hh4 = _swing_high(df240, 20)
-    ll4 = _swing_low(df240, 20)
-    if c1 > hh4: return "UP"
-    if c1 < ll4: return "DOWN"
-    hh1 = _swing_high(df60, 20)
-    ll1 = _swing_low(df60, 20)
-    if c1 > hh1: return "UP"
-    if c1 < ll1: return "DOWN"
-    return "UP"
-
 def had_liquidity_sweep(df, lookback=20):
     if df is None or df.empty or len(df) < lookback+3: return (False,"")
     i = len(df) - 2
@@ -376,206 +396,210 @@ def had_liquidity_sweep(df, lookback=20):
     if L < ll and C > ll: return True, "UP"
     return False, ""
 
-def dynamic_buffer(symbol: str) -> float:
-    return SPREAD_BUFFER.get(symbol, 0.0)
+def is_consolidation_break(df):
+    if df is None or df.empty or len(df) < 20: return False
+    i = len(df) - 2
+    window = df.iloc[i-12:i].copy()
+    rng = float((window["High"].max() - window["Low"].min()) or 0.0)
+    base = float(window["Close"].iloc[-1])
+    if base <= 0: return False
+    if (rng / base) <= 0.003:
+        H = float(df["High"].iloc[i]); L = float(df["Low"].iloc[i])
+        return H > window["High"].max() or L < window["Low"].min()
+    return False
 
-# --- локальные экстремумы на 1m (pivot'ы) ---
-def _local_extrema_1m(df1m: pd.DataFrame, lookback: int, mode: str):
-    if df1m is None or df1m.empty:
-        return []
-    data = df1m.tail(max(lookback, 50)).reset_index(drop=True)
-    if len(data) < 7:
-        return []
-    highs = data["High"].astype(float).to_numpy()
-    lows  = data["Low"].astype(float).to_numpy()
-    res = []
-    for i in range(3, len(data)-3):
-        if mode == "high":
-            window = highs[i-3:i+4]
-            price = float(highs[i])
-            if price >= float(window.max()):
-                res.append(("H", price))
-        else:
-            window = lows[i-3:i+4]
-            price = float(lows[i])
-            if price <= float(window.min()):
-                res.append(("L", price))
-    return res
+def inside_higher_ob(df_low, df_high):
+    if df_low is None or df_low.empty or df_high is None or df_high.empty: return False
+    if len(df_low) < 5 or len(df_high) < 5: return False
+    cl  = float(df_low["Close"].iloc[-2])
+    body = df_high.iloc[-2]
+    top = max(float(body["Open"]), float(body["Close"]))
+    bot = min(float(body["Open"]), float(body["Close"]))
+    return bot <= cl <= top
 
-# собрать уровни разного масштаба из 1m
-def _collect_levels_multiscale(df1m: pd.DataFrame, bias: str):
-    # набор окон в барах (мин)
-    scales = [60, 120, 180, 360, 720]
-    ups, downs = set(), set()
-    for win in scales:
-        hs = _local_extrema_1m(df1m, win, "high")
-        ls = _local_extrema_1m(df1m, win, "low")
-        for _, p in hs: ups.add(round(float(p), 8))
-        for _, p in ls: downs.add(round(float(p), 8))
-    # вернём списки
-    return sorted(list(ups)), sorted(list(downs))
+def nearest_level_above(df: pd.DataFrame, price: float, lookback: int = 30) -> float | None:
+    if df is None or df.empty: return None
+    # берём пики выше цены и выбираем ближайший
+    highs = df["High"].tail(lookback)
+    candidates = highs[highs > price]
+    if candidates.empty: return None
+    return float(candidates.min())
 
-def momentum_confirmation_simple(df1m: pd.DataFrame, side: str):
-    # без ATR: проверяем 4 последних тела и суммарное направление
-    if df1m is None or df1m.empty or len(df1m) < 6:
-        return False, ""
-    recent = df1m.iloc[-5:-1].copy()
-    bodies = (recent["Close"] - recent["Open"]).astype(float)
-    aligned = int((bodies > 0).sum() if side=="BUY" else (bodies < 0).sum())
-    net_move = float(recent["Close"].iloc[-1] - recent["Open"].iloc[0])
-    direction_ok = net_move > 0 if side=="BUY" else net_move < 0
-    # не хотим входить после “слишком большого” импульса: сравним с средним H-L последних 20 баров
-    rng = (df1m["High"] - df1m["Low"]).astype(float)
-    avg_rng = float(rng.tail(20).mean() or 0.0)
-    too_late = abs(net_move) > 1.2 * avg_rng if avg_rng > 0 else False
-    ok = (aligned >= 2) and direction_ok and (not too_late)
-    if not ok:
-        return False, ""
-    reason = f"Импульс подтверждён {aligned}/4 свечами 1m, вход не поздний"
-    return True, reason
+def nearest_level_below(df: pd.DataFrame, price: float, lookback: int = 30) -> float | None:
+    if df is None or df.empty: return None
+    lows = df["Low"].tail(lookback)
+    candidates = lows[lows < price]
+    if candidates.empty: return None
+    return float(candidates.max())
 
 def dxy_bias_from_df(dxy_1m: pd.DataFrame) -> str|None:
     if dxy_1m is None or dxy_1m.empty: return None
     df60 = _resample(dxy_1m, 60)
     df240 = _resample(dxy_1m, 240)
     if df60.empty or df240.empty: return None
-    return bias_bos_higher(df60, df240)
+    # простой BOS
+    c1 = float(df60["Close"].iloc[-2])
+    hh4 = _swing_high(df240, 20); ll4=_swing_low(df240,20)
+    if c1 > hh4: return "UP"
+    if c1 < ll4: return "DOWN"
+    hh1 = _swing_high(df60, 20); ll1=_swing_low(df60,20)
+    if c1 > hh1: return "UP"
+    if c1 < ll1: return "DOWN"
+    return None
+
+def dynamic_buffer(symbol: str) -> float:
+    return SPREAD_BUFFER.get(symbol, 0.0)
 
 def format_signal(setup, buffer):
     sym=setup["symbol"]; side=setup["side"]; tf=setup["tf"]
-    header = (
-        f"🧠 IDEA:\n"
+    rr = max(setup.get('rr',0.0), 0.0)
+    return (
         f"🔥 {side} {SYMBOLS[sym]['name']} | {tf}\n"
         f"✅ TP: **{rnd(sym,setup['tp'])}**\n"
         f"🟥 SL: **{rnd(sym,setup['sl'])}**\n"
         f"Entry: {rnd(sym,setup['entry'])}  SpreadBuf≈{rnd(sym,buffer)}  "
-        f"RR≈{round(setup['rr'],2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
+        f"RR≈{round(rr,2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
-    reasons = setup.get("reasons", [])
-    if reasons:
-        header += "\n🧠 Почему:\n" + "\n".join(f"• {r}" for r in reasons)
-    return header
 
-# ===================== BUILD SETUP =====================
+# ===================== BUILD SETUP (NO-ATR TP/SL) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
     if df1m is None or df1m.empty or len(df1m) < 200:
         return None
 
-    # MTF (из 1m): используем для направления и контекста, НЕ для жёстких правил
-    df5    = _resample(df1m, 5)
-    df15   = _resample(df1m, 15)
-    df60   = _resample(df1m, 60)
-    df240  = _resample(df1m, 240)
-    df1440 = _resample(df1m, 1440)
-    if df5.empty or df15.empty or df60.empty or df240.empty:
-        return None
+    # MTF
+    df5   = _resample(df1m, 5)
+    df15  = _resample(df1m, 15)
+    df60  = _resample(df1m, 60)
+    df240 = _resample(df1m, 240)
+    if df5.empty or df15.empty or df60.empty or df240.empty: return None
 
-    bias = bias_bos_higher(df60, df240)  # ориентир с H1/H4
-    reasons = [f"H1/H4 структура → {('вверх' if bias=='UP' else 'вниз')}"]
+    # bias по H1/H4
+    c1 = float(df60["Close"].iloc[-2])
+    hh4 = _swing_high(df240, 20); ll4=_swing_low(df240,20)
+    if   c1 > hh4:  bias = "UP"
+    elif c1 < ll4:  bias = "DOWN"
+    else:
+        hh1 = _swing_high(df60, 20); ll1=_swing_low(df60,20)
+        bias = "UP" if c1 > hh1 else ("DOWN" if c1 < ll1 else "UP")
 
-    # глазам нужен контекст ликвидности
-    fvg_ok, fvg_dir, _, _, fvg_w = fvg_last_soft(df15, lookback=20, use_bodies=True, min_abs=0.0, min_rel_to_avg=0.0)
-    if fvg_ok:
-        reasons.append(f"Свежий {('бычий' if fvg_dir=='BULL' else 'медвежий')} FVG на M15")
-
+    # локальные факторы
+    fvg_ok, fvg_dir, fvg_top, fvg_bot, fvg_w = fvg_last_soft(df15, lookback=24, use_bodies=True)
+    choch_up   = choch_soft(df5, "UP",   8, False)
+    choch_down = choch_soft(df5, "DOWN", 8, False)
     sweep15, sweep_dir15 = had_liquidity_sweep(df15, lookback=20)
-    if sweep15:
-        reasons.append("Вынос ликвидности на M15 перед входом")
+    cons_break = is_consolidation_break(df5)
 
-    side = "BUY" if bias == "UP" else "SELL"
+    # сторона
+    side = "BUY" if bias=="UP" else "SELL"
     if sweep15:
-        if sweep_dir15 == "UP": side = "BUY"
-        if sweep_dir15 == "DOWN": side = "SELL"
+        if sweep_dir15=="UP": side="BUY"
+        if sweep_dir15=="DOWN": side="SELL"
 
-    entry = float(df1m["Close"].iloc[-2])
+    entry = float(df5["Close"].iloc[-2])
     buf   = dynamic_buffer(symbol)
 
-    # уровни из многомасштабной 1m-структуры
-    ups, downs = _collect_levels_multiscale(df1m, bias)
-
-    # SL — прячем за ближайшую противоположную ликвидность, но не слишком близко
-    sl_price = None
+    # SL: за ближайший структурный уровень + буфер спреда
+    lo15  = _swing_low(df15, 20)
+    hi15  = _swing_high(df15, 20)
     if side == "BUY":
-        lower = [p for p in downs if p < entry]; lower.sort(reverse=True)
-        for a in lower:
-            c = float(a) - buf
-            if (entry - c) >= SL_MIN_GAP.get(symbol, buf):
-                sl_price = c
-                reasons.append(f"SL под локальным минимумом ≈ {rnd(symbol, a)}")
-                break
+        sl = min(entry, lo15 - buf)
     else:
-        upper = [p for p in ups if p > entry]; upper.sort()
-        for a in upper:
-            c = float(a) + buf
-            if (c - entry) >= SL_MIN_GAP.get(symbol, buf):
-                sl_price = c
-                reasons.append(f"SL над локальным максимумом ≈ {rnd(symbol, a)}")
-                break
-    if sl_price is None:
-        return None
+        sl = max(entry, hi15 + buf)
 
-    # TP — ближайшая по ходу ликвидность (не ставим “внутрь” уровня, даём отступ на спред)
-    tp_price = None
+    # TP: до БЛИЖАЙШЕГО значимого уровня (NO-ATR)
+    # ищем уровень на 5m (ближайший) и на 15m (подстраховка), берём ближайший по цене
     if side == "BUY":
-        forward = [u for u in ups if u > entry]; forward.sort()
-        for a in forward:
-            t = float(a) - buf
-            if t > entry and (t - entry) >= (SPREAD_BUFFER.get(symbol,0.0) + TP_EXTRA_BUFFER.get(symbol,0.0)):
-                tp_price = t
-                reasons.append(f"TP перед ликвидностью ≈ {rnd(symbol, a)}")
-                break
+        lvl5  = nearest_level_above(df5,  entry,  36)
+        lvl15 = nearest_level_above(df15, entry,  36)
+        target = None
+        if lvl5 is not None and lvl15 is not None:
+            target = min(lvl5, lvl15)
+        else:
+            target = lvl5 if lvl5 is not None else lvl15
+        # если уровней выше нет — возьмём половину расстояния до hi15 (чтобы цель была реальная)
+        if target is None or target <= entry:
+            target = max(entry + max(entry - sl, 1e-9)*0.8, entry + TP_MIN_ABS.get(symbol,0.0))
+        tp = target + buf  # компенсация спреда для BUY
     else:
-        forward = [d for d in downs if d < entry]; forward.sort(reverse=True)
-        for a in forward:
-            t = float(a) + buf
-            if t < entry and (entry - t) >= (SPREAD_BUFFER.get(symbol,0.0) + TP_EXTRA_BUFFER.get(symbol,0.0)):
-                tp_price = t
-                reasons.append(f"TP до ликвидности ≈ {rnd(symbol, a)}")
-                break
-    if tp_price is None:
+        lvl5  = nearest_level_below(df5,  entry,  36)
+        lvl15 = nearest_level_below(df15, entry,  36)
+        target = None
+        if lvl5 is not None and lvl15 is not None:
+            target = max(lvl5, lvl15)
+        else:
+            target = lvl5 if lvl5 is not None else lvl15
+        if target is None or target >= entry:
+            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol,0.0))
+        tp = target - buf  # компенсация спреда для SELL
+
+    tp_abs = abs(tp - entry)
+    tp_min = TP_MIN_ABS.get(symbol, 0.0)
+    if tp_abs < tp_min:
+        # не торгуем микродвижение
         return None
 
-    # микро-импульс 1m — чтоб не заходить в самый хвост
-    ok_mom, mom_reason = momentum_confirmation_simple(df1m, side)
-    if not ok_mom:
-        return None
-    reasons.append(mom_reason)
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
 
-    # лёгкие бонусы
-    if _in_session_utc(): reasons.append("Активная сессия добавляет ликвидности")
+    # скоринг уверенности (без RR/ATR)
+    score = 0
+    # базовые «глаза»
+    if fvg_ok or cons_break: score += 25
+    if sweep15:              score += 20
+    if (side=="BUY" and choch_up) or (side=="SELL" and choch_down): score += 15
+    if inside_higher_ob(df5, df60) or inside_higher_ob(df5, df240): score += 10
+    if _in_session_utc(): score += 5
+    # лёгкий бонус, если TP недалеко (быстрый профит)
+    if rr <= 1.0: score += 10
+    # золото с DXY (противофаза)
     if symbol == "XAU" and dxy_bias:
-        if side == "BUY" and dxy_bias == "DOWN":
-            reasons.append("DXY ↓ поддерживает лонг по золоту")
-        if side == "SELL" and dxy_bias == "UP":
-            reasons.append("DXY ↑ поддерживает шорт по золоту")
+        if side == "BUY"  and dxy_bias == "DOWN": score += 10
+        if side == "SELL" and dxy_bias == "UP":   score += 10
 
-    rr = abs(tp_price - entry) / max(abs(entry - sl_price), 1e-9)
-
-    # скоринг (простой и понятный)
-    score = 10
-    if fvg_ok:               score += 12
-    if sweep15:              score += 14
-    if rr >= 1.2:            score += 8
-    if rr >= 1.6:            score += 6
-    if _in_session_utc():    score += 4
-    conf = max(0.0, min(1.0, score/100.0))
+    score = max(0, min(100, score))
+    conf  = score / 100.0
     if conf < CONF_MIN_IDEA:
         return None
 
     return {
         "symbol": symbol, "tf": tf_label,
         "side": side, "trend": bias,
-        "entry": entry, "tp": float(tp_price), "sl": float(sl_price),
-        "rr": rr, "conf": conf, "tp_abs": abs(tp_price - entry),
-        "tp_min": SPREAD_BUFFER.get(symbol,0.0) + TP_EXTRA_BUFFER.get(symbol,0.0),
-        "reasons": reasons
+        "entry": entry, "tp": tp, "sl": sl,
+        "rr": rr, "conf": conf, "tp_abs": tp_abs, "tp_min": tp_min
     }
 
-# ===================== ENGINE =====================
-_last_idea_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
-_ideas_count_hour = {"NG": 0, "XAU": 0, "BTC": 0}
-_ideas_count_hour_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
+# ===================== EXECUTION / LOGGING =====================
+def append_trade(row):
+    newf = not os.path.exists(TRADES_CSV)
+    with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if newf: w.writeheader()
+        w.writerow(row)
 
+async def notify_outcome(symbol: str, outcome: str, price: float):
+    name = SYMBOLS[symbol]["name"]; p = rnd(symbol, price)
+    text = f"✅ TP hit on {name} @ {p}" if outcome=="TP" else f"🟥 SL hit on {name} @ {p}"
+    await send_main(text)
+
+def finish_trade(symbol: str, outcome: str, price_now: float):
+    sess = trade[symbol]
+    trade[symbol] = None
+    cooldown_until[symbol] = time.time() + COOLDOWN_SEC
+    if not sess: return
+    try:
+        rr = (sess["tp"]-sess["entry"]) if sess["side"]=="BUY" else (sess["entry"]-sess["tp"])
+        rl = (sess["entry"]-sess["sl"]) if sess["side"]=="BUY" else (sess["sl"]-sess["entry"])
+        append_trade({
+            "ts_close": datetime.utcnow().isoformat(timespec="seconds"),
+            "symbol": symbol, "side": sess["side"],
+            "entry": rnd(symbol, sess["entry"]), "tp": rnd(symbol, sess["tp"]),
+            "sl": rnd(symbol, sess["sl"]), "outcome": outcome,
+            "rr_ratio": round(float(rr)/max(float(rl),1e-9), 3),
+            "life_sec": int(time.time()-sess.get("opened_at", time.time())),
+        })
+    except Exception as e:
+        logging.error(f"log append error: {e}")
+
+# ===================== ENGINE =====================
 def _reset_hour_if_needed(sym: str):
     now = time.time()
     start = _ideas_count_hour_ts.get(sym, 0.0) or 0.0
@@ -586,7 +610,7 @@ def _reset_hour_if_needed(sym: str):
 def can_send_idea(sym: str) -> bool:
     if not SEND_IDEAS: return False
     now = time.time()
-    if now - _last_idea_ts.get(sym, 0.0) < IDEA_COOLDOWN_SEC:
+    if IDEA_COOLDOWN_SEC > 0 and (now - _last_idea_ts.get(sym, 0.0) < IDEA_COOLDOWN_SEC):
         return False
     _reset_hour_if_needed(sym)
     if _ideas_count_hour.get(sym, 0) >= MAX_IDEAS_PER_HOUR:
@@ -594,12 +618,15 @@ def can_send_idea(sym: str) -> bool:
     return True
 
 def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
-    # сигналим только если цена не убежала дальше “свежести”
-    lim = 10.0 * SPREAD_BUFFER.get(symbol, 0.0)
+    # без строгих ограничений — просто не допускаем «сигнал по старой цене»
+    buf = SPREAD_BUFFER.get(symbol, 0.0)
+    lim = 15.0 * buf
     return abs(float(entry) - float(close_now)) <= lim
 
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
-    # режим: если один рынок выбран, не трогаем другие
+    global last_seen_idx, last_signal_idx
+
+    # AUTO: NG+XAU; ручной — только выбранный
     if mode != "AUTO" and symbol not in (mode,):
         return
 
@@ -609,57 +636,78 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
 
     cur_idx = len(df) - 1
     closed_idx = cur_idx - 1
-    if closed_idx <= _last_signal_idx[symbol]:
+    if closed_idx <= last_seen_idx[symbol]:
+        return
+    last_seen_idx[symbol] = closed_idx
+
+    # сопровождение открытой сделки
+    sess = trade[symbol]
+    if sess:
+        start_i = int(sess.get("entry_bar_idx", cur_idx))
+        post = df.iloc[(start_i + 1):]
+        if not post.empty:
+            side = sess["side"]; tp = sess["tp"]; sl = sess["sl"]
+            hit_tp = (post["High"].max() >= tp) if side=="BUY" else (post["Low"].min() <= tp)
+            hit_sl = (post["Low"].min()  <= sl) if side=="BUY" else (post["High"].max() >= sl)
+            if hit_tp:
+                price_now = float(post["Close"].iloc[-1])
+                asyncio.create_task(notify_outcome(symbol, "TP", price_now))
+                finish_trade(symbol, "TP", price_now); return
+            if hit_sl:
+                price_now = float(post["Close"].iloc[-1])
+                asyncio.create_task(notify_outcome(symbol, "SL", price_now))
+                finish_trade(symbol, "SL", price_now); return
         return
 
-    # dxy только для XAU
+    # глобальные кулдауны
+    if time.time() - boot_ts < BOOT_COOLDOWN_S: return
+    if time.time() < cooldown_until[symbol]:   return
+
+    # DXY только для XAU
     dxy_bias = dxy_bias_from_df(dxy_df) if symbol=="XAU" and dxy_df is not None and not dxy_df.empty else None
 
     setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"], dxy_bias=dxy_bias)
     if not setup:
-        _last_signal_idx[symbol] = closed_idx
         return
 
-    # свежесть/антидубль
+    if last_signal_idx[symbol] == closed_idx:
+        return
+    last_signal_idx[symbol] = closed_idx
+
+    buffer    = dynamic_buffer(symbol)
+    conf_thr  = CONF_MIN_TRADE.get(symbol, 0.55)
+    conf      = float(setup["conf"])
     close_now = float(df["Close"].iloc[-1])
-    if not is_fresh_enough(symbol, float(setup["entry"]), close_now):
-        _last_signal_idx[symbol] = closed_idx
+    entry     = float(setup["entry"])
+
+    if not is_fresh_enough(symbol, entry, close_now):
         return
 
-    fingerprint = f"{setup['side']}|{rnd(symbol,setup['entry'])}|{rnd(symbol,setup['tp'])}|{rnd(symbol,setup['sl'])}"
-    if fingerprint == _last_signal_fingerprint.get(symbol, ""):
-        _last_signal_idx[symbol] = closed_idx
-        return
-
-    # IDEA
-    if setup["conf"] >= CONF_MIN_IDEA and setup["rr"] >= RR_MIN_IDEA and can_send_idea(symbol):
-        txt = format_signal(setup, dynamic_buffer(symbol))
-        await send_main(txt)
-        _last_signal_idx[symbol] = closed_idx
-        _last_signal_fingerprint[symbol] = fingerprint
+    if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
+        await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
         _ideas_count_hour[symbol] = _ideas_count_hour.get(symbol, 0) + 1
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
-        return
 
-    # “боевой” (просто более сильная идея — ТЫ всё равно решаешь руками)
-    if setup["conf"] >= CONF_MIN_TRADE and setup["rr"] >= RR_TRADE_MIN:
-        txt = format_signal(setup, dynamic_buffer(symbol))
-        await send_main(txt)
-        _last_signal_idx[symbol] = closed_idx
-        _last_signal_fingerprint[symbol] = fingerprint
-        return
+    if conf >= conf_thr and (setup["tp_abs"] >= setup["tp_min"]):
+        await send_main(format_signal(setup, buffer))
+        trade[symbol] = {
+            "side": setup["side"],
+            "entry": float(setup["entry"]),
+            "tp": float(setup["tp"]),
+            "sl": float(setup["sl"]),
+            "opened_at": time.time(),
+            "entry_bar_idx": cur_idx,
+        }
 
 async def engine_loop():
     async with aiohttp.ClientSession() as session:
-        dxy_df = None
-        dxy_ts = 0.0
+        dxy_df = None; dxy_ts = 0.0
         while True:
             try:
                 if time.time() - dxy_ts > 25:
-                    dxy_df = await get_dxy_df(session)
-                    dxy_ts = time.time()
+                    dxy_df = await get_dxy_df(session); dxy_ts = time.time()
                 symbols_to_run = ("NG","XAU") if mode == "AUTO" else (mode,)
                 for s in symbols_to_run:
                     await handle_symbol(session, s, dxy_df)
@@ -668,7 +716,7 @@ async def engine_loop():
                 logging.error(f"engine error: {e}")
                 await asyncio.sleep(2)
 
-# ===================== ALIVE LOOP (ATR только в логах) =====================
+# ===================== ALIVE LOOP =====================
 def _atr_m15(df: pd.DataFrame) -> float:
     d = _resample(df, 15)
     if d.empty: return 0.0
@@ -682,21 +730,22 @@ async def alive_loop():
                 df_ng  = await get_df(s, "NG")
                 df_xau = await get_df(s, "XAU")
                 df_btc = await get_df(s, "BTC")
+
             c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty else 0.0
             c_xau = float(df_xau["Close"].iloc[-1]) if not df_xau.empty else 0.0
             c_btc = float(df_btc["Close"].iloc[-1]) if not df_btc.empty else 0.0
+
             a_ng  = _atr_m15(df_ng)  if not df_ng.empty else 0.0
             a_xau = _atr_m15(df_xau) if not df_xau.empty else 0.0
             a_btc = _atr_m15(df_btc) if not df_btc.empty else 0.0
+
             state["atr_NG"]  = rnd("NG", a_ng)
             state["atr_XAU"] = rnd("XAU", a_xau)
             state["atr_BTC"] = rnd("BTC", a_btc)
-            msg = (
-                f"[ALIVE] "
-                f"NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} | "
-                f"XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)} | "
-                f"BTC: {rnd('BTC',c_btc)}, ATR15: {rnd('BTC',a_btc)}. Status: OK."
-            )
+
+            msg = (f"[ALIVE] NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} | "
+                   f"XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)} | "
+                   f"BTC: {rnd('BTC',c_btc)}, ATR15: {rnd('BTC',a_btc)}. Status: OK.")
             await send_log(msg)
         except Exception as e:
             await send_log(f"[ALIVE ERROR] {e}")

@@ -15,7 +15,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V7.0 Human-Trader (SMC/MTF, no-ATR logic, structure TP/SL, 1s speed, BTC manual)"
+VERSION = "V7.1 Human-Pro (SMC/MTF, memory of levels, no-ATR logic, structure TP/SL, anti-dup, 1s speed, BTC manual)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -24,51 +24,42 @@ OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
-# tf в подписи сигнала; данные берём 1m и ресемплим
+# tf в подписи сигнала; сами данные берём 1m и ресемплим
 SYMBOLS = {
-    "BTC": {"name": "BTC-USD",         "tf": "5m"},  # BTC включаешь вручную («биток»)
-    "NG":  {"name": "NATGAS (NG=F)",   "tf": "1m"},
-    "XAU": {"name": "GOLD (XAUUSD=X)", "tf": "1m"},
+    "BTC": {"name": "BTC-USD",          "tf": "5m"},   # BTC включаешь вручную /биток
+    "NG":  {"name": "NATGAS (NG=F)",    "tf": "1m"},
+    "XAU": {"name": "GOLD (XAUUSD=X)",  "tf": "1m"},
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
-# ==== Память уровней (сколько истории смотреть) ====
-# 5m: 48 часов (2 суток) истории -> 48*60/5 = 576 баров
-# 15m: 7 суток истории -> 7*24*60/15 = 672 баров
-MEMORY_HOURS_5M  = 48
-MEMORY_DAYS_15M  = 7
-
-LOOKBACK_5M  = int(MEMORY_HOURS_5M * 60 / 5)
-LOOKBACK_15M = int(MEMORY_DAYS_15M * 24 * 60 / 15)
-
-# спред-буферы (для SL и компенсации в TP)
+# Спред-буферы (для SL и компенсации TP)
 SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
 
-# минимальная дистанция TP (чтобы не было микротейков)
-TP_MIN_ABS = {"NG": 0.0080, "XAU": 0.80, "BTC": 25.0}
+# Минимальная реальная дистанция TP (без микродвижений)
+TP_MIN_ABS = {"NG": 0.0100, "XAU": 0.80, "BTC": 25.0}   # как просил: NG минимум 0.010
 
-# требования по уверенности
-CONF_MIN_TRADE = {"NG": 0.42, "XAU": 0.55, "BTC": 0.55}
+# Порог уверенности (BTC можешь поднять до 0.70)
+CONF_MIN_TRADE = {"NG": 0.45, "XAU": 0.55, "BTC": 0.55}
 CONF_MIN_IDEA  = 0.05
 
-# RR-фильтров нет (оставлены нули для отображения)
+# RR-фильтров нет (оставлены 0 — только для отображения)
 RR_TRADE_MIN = 0.0
 RR_MIN_IDEA  = 0.0
 
-# антиспам идей выключен (новая IDEA можно сразу, если нет сделки)
+# Антиспам идей отключён; новый сигнал только при отсутствии позиции
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
-MAX_IDEAS_PER_HOUR = 60
+MAX_IDEAS_PER_HOUR = 120
 
-# сессии — лёгкий бонус к скору (не блокируют)
+# Торговые окна — лёгкий бонус к скору
 LONDON_HOURS = range(7, 15)
 NY_HOURS     = range(12, 21)
 
-# скорость/интервалы
+# Скорость и интервалы
 POLL_SEC        = 1
 ALIVE_EVERY_SEC = 300
 BOOT_COOLDOWN_S = 20
-COOLDOWN_SEC    = 7  # можешь поставить 0, если хочешь «без паузы»
+COOLDOWN_SEC    = 0    # как просил — без паузы после SL
 
 TRADES_CSV = "gv_trades.csv"
 
@@ -98,11 +89,19 @@ _ideas_count_hour_ts = {"NG": 0.0, "XAU": 0.0, "BTC": 0.0}
 
 last_seen_idx   = {"NG": -1, "XAU": -1, "BTC": -1}
 last_signal_idx = {"NG": -1, "XAU": -1, "BTC": -1}
+_last_signal_price = {"NG": None, "XAU": None, "BTC": None}
 
 _prices_cache = {}
-state = {}
+state = {
+    "levels": {"NG": [], "XAU": [], "BTC": []},  # память уровней
+}
 mode = "AUTO"          # AUTO: NG + XAU; BTC — вручную
 requested_mode = "AUTO"
+
+# Параметры памяти уровней (сколько часов смотрим на ТФ)
+LEVEL_MEMORY_HOURS = {"5m": 72, "15m": 72, "60m": 120}
+LEVEL_DEDUP_TOL    = {"NG": 0.003, "XAU": 0.30, "BTC": 8.0}   # как слипать близкие уровни (по инструменту)
+LEVEL_EXPIRE_SEC   = 48 * 3600                                 # старше 48ч — выкидываем
 
 # ===================== TELEGRAM =====================
 router = Router()
@@ -171,7 +170,7 @@ async def cmd_stop(m: Message):
     now = time.time()
     for s in trade.keys():
         trade[s] = None
-        cooldown_until[s] = now + 5
+        cooldown_until[s] = now + 3
     await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
 
 @router.message(F.text.lower() == "статус")
@@ -185,7 +184,8 @@ async def cmd_status(m: Message):
         atrtxt = state.get(f"atr_{s}", "—")
         nm = SYMBOLS[s]["name"]
         cd = max(0, int(cooldown_until[s]-now))
-        lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s")
+        L = len(state["levels"][s]) if isinstance(state.get("levels",{}).get(s), list) else 0
+        lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s  levels_mem={L}")
     await m.answer("```\n"+ "\n".join(lines) + "\n```")
 
 @router.message(F.text.lower() == "отчет")
@@ -247,7 +247,7 @@ def _df_from_yahoo_v8(payload: dict) -> pd.DataFrame:
         df = df.ffill().bfill().dropna()
         for col in ("Open","High","Low","Close"):
             df = df[df[col] > 0]
-        return df.tail(1000).reset_index(drop=True)
+        return df.tail(2000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -259,7 +259,7 @@ def _df_from_stooq_csv(text: str):
         df = pd.read_csv(StringIO(text))
         if not {"Open","High","Low","Close"}.issubset(set(df.columns)):
             return pd.DataFrame()
-        return df.tail(1000).reset_index(drop=True)
+        return df.tail(2000).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -283,7 +283,7 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
     if symbol == "NG":
         for t in ("NG%3DF",):
-            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
+            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"))
             if not df.empty:
                 last_candle_close_ts["NG"] = time.time()
                 _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
@@ -297,7 +297,7 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
     if symbol == "XAU":
         for t in ("XAUUSD%3DX", "GC%3DF"):
-            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
+            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"))
             if not df.empty:
                 last_candle_close_ts["XAU"] = time.time()
                 _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
@@ -312,7 +312,7 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
     if symbol == "BTC":
         for t in ("BTC-USD",):
-            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
+            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"))
             if not df.empty:
                 last_candle_close_ts["BTC"] = time.time()
                 _prices_cache["BTC"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
@@ -323,7 +323,7 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
 
 async def get_dxy_df(session: aiohttp.ClientSession) -> pd.DataFrame:
     for t in DXY_TICKERS:
-        df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=1d"))
+        df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"))
         if not df.empty:
             return df
     return pd.DataFrame()
@@ -426,19 +426,83 @@ def inside_higher_ob(df_low, df_high):
     bot = min(float(body["Open"]), float(body["Close"]))
     return bot <= cl <= top
 
-def nearest_level_above(df: pd.DataFrame, price: float, lookback: int = 30) -> float | None:
-    if df is None or df.empty: return None
-    highs = df["High"].tail(lookback)
-    candidates = highs[highs > price]
-    if candidates.empty: return None
-    return float(candidates.min())
+def _bars_for_hours(tf: str, hours: int) -> int:
+    if tf == "5m":  return hours * 12
+    if tf == "15m": return hours * 4
+    if tf == "60m": return hours * 1
+    return hours * 12
 
-def nearest_level_below(df: pd.DataFrame, price: float, lookback: int = 30) -> float | None:
-    if df is None or df.empty: return None
-    lows = df["Low"].tail(lookback)
-    candidates = lows[lows < price]
-    if candidates.empty: return None
-    return float(candidates.max())
+def _dedup_level_list(levels: list, tol: float) -> list:
+    out = []
+    for L in sorted(levels, key=lambda x: x["price"]):
+        if not out: 
+            out.append(L); continue
+        if abs(L["price"] - out[-1]["price"]) <= tol:
+            # усиливаем «сильный» уровень — оставляем с бОльшим весом
+            if L.get("strength",1) > out[-1].get("strength",1):
+                out[-1] = L
+        else:
+            out.append(L)
+    return out
+
+def extract_levels(df: pd.DataFrame, tf_label: str, lookback_hours: int, now_ts: float, kind: str) -> list:
+    """kind in {'HH','LL'} — берём локальные экстремумы в заданном окне."""
+    if df is None or df.empty: return []
+    bars = _bars_for_hours(tf_label, lookback_hours)
+    d = df.tail(max(bars, 30)).copy()
+    out = []
+    n = len(d)
+    if n < 10: return out
+    rng = (d["High"].max() - d["Low"].min()) or 0.0
+    if rng <= 0: return out
+
+    # локальные swing по окну k
+    k = 3
+    for i in range(k, n-k):
+        hi = float(d["High"].iloc[i]); lo = float(d["Low"].iloc[i])
+        if kind == "HH":
+            if hi == max(d["High"].iloc[i-k:i+k+1]):
+                out.append({"price": hi, "tf": tf_label, "ts": now_ts, "kind": "HH", "strength": 1})
+        else:
+            if lo == min(d["Low"].iloc[i-k:i+k+1]):
+                out.append({"price": lo, "tf": tf_label, "ts": now_ts, "kind": "LL", "strength": 1})
+    return out
+
+def build_level_memory(symbol: str, df1m: pd.DataFrame):
+    """Обновляем память уровней: HH/LL с 5m/15m/60m, дедуп, чистка по времени."""
+    if df1m is None or df1m.empty: return
+    now_ts = time.time()
+
+    df5   = _resample(df1m, 5)
+    df15  = _resample(df1m, 15)
+    df60  = _resample(df1m, 60)
+
+    mem = state["levels"].get(symbol, [])
+    # удаляем старое
+    mem = [L for L in mem if now_ts - L.get("ts", now_ts) <= LEVEL_EXPIRE_SEC]
+
+    # наращиваем из свежих данных
+    for tf, d, hours in (("5m", df5, LEVEL_MEMORY_HOURS["5m"]),
+                         ("15m", df15, LEVEL_MEMORY_HOURS["15m"]),
+                         ("60m", df60, LEVEL_MEMORY_HOURS["60m"])):
+        mem += extract_levels(d, tf, hours, now_ts, "HH")
+        mem += extract_levels(d, tf, hours, now_ts, "LL")
+
+    # дедуп по близости цены
+    tol = LEVEL_DEDUP_TOL.get(symbol, 0.003)
+    mem = _dedup_level_list(mem, tol)
+    state["levels"][symbol] = mem
+
+def nearest_level_from_memory(symbol: str, side: str, price: float) -> float | None:
+    """Берём ближайший уровень из памяти в сторону TP."""
+    mem = state["levels"].get(symbol, []) or []
+    if not mem: return None
+    above = [L["price"] for L in mem if L["price"] > price]
+    below = [L["price"] for L in mem if L["price"] < price]
+    if side == "BUY":
+        return min(above) if above else None
+    else:
+        return max(below) if below else None
 
 def dxy_bias_from_df(dxy_1m: pd.DataFrame) -> str|None:
     if dxy_1m is None or dxy_1m.empty: return None
@@ -468,10 +532,13 @@ def format_signal(setup, buffer):
         f"RR≈{round(rr,2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
-# ===================== BUILD SETUP (NO-ATR TP/SL) =====================
+# ===================== BUILD SETUP (MEMORY-LEVEL TP/SL) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
-    if df1m is None or df1m.empty or len(df1m) < 200:
+    if df1m is None or df1m.empty or len(df1m) < 240:
         return None
+
+    # Обновим память уровней для символа (на фоне 1m)
+    build_level_memory(symbol, df1m)
 
     # MTF
     df5   = _resample(df1m, 5)
@@ -505,41 +572,58 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     entry = float(df5["Close"].iloc[-2])
     buf   = dynamic_buffer(symbol)
 
-    # SL: за ближайший структурный уровень + буфер спреда
+    # SL: за ближайший структурный уровень (15m swing) + буфер спреда
     lo15  = _swing_low(df15, 20)
     hi15  = _swing_high(df15, 20)
     if side == "BUY":
         sl = min(entry, lo15 - buf)
-        # safety: SL должен быть ниже entry
-        if sl >= entry:
-            sl = entry - max(buf*1.2, 1e-6)
     else:
         sl = max(entry, hi15 + buf)
-        # safety: SL должен быть выше entry
-        if sl <= entry:
-            sl = entry + max(buf*1.2, 1e-6)
 
-    # TP: ближайший значимый уровень (NO-ATR) + компенсация спреда
+    # ===== TP: ближайший уровень из памяти уровней =====
+    mem_target = nearest_level_from_memory(symbol, side, entry)
+    if mem_target is None:
+        # fallback: ближайший уровень на 5m/15m
+        def nearest_level_above(df: pd.DataFrame, price: float, lookback_bars: int) -> float | None:
+            highs = df["High"].tail(lookback_bars)
+            c = highs[highs > price]
+            return float(c.min()) if not c.empty else None
+        def nearest_level_below(df: pd.DataFrame, price: float, lookback_bars: int) -> float | None:
+            lows = df["Low"].tail(lookback_bars)
+            c = lows[lows < price]
+            return float(c.max()) if not c.empty else None
+
+        lb5  = _bars_for_hours("5m", 72)
+        lb15 = _bars_for_hours("15m", 72)
+
+        if side == "BUY":
+            lvl5  = nearest_level_above(df5,  entry,  lb5)
+            lvl15 = nearest_level_above(df15, entry,  lb15)
+            if lvl5 is not None and lvl15 is not None:
+                mem_target = min(lvl5, lvl15)
+            else:
+                mem_target = lvl5 if lvl5 is not None else lvl15
+        else:
+            lvl5  = nearest_level_below(df5,  entry,  lb5)
+            lvl15 = nearest_level_below(df15, entry,  lb15)
+            if lvl5 is not None and lvl15 is not None:
+                mem_target = max(lvl5, lvl15)
+            else:
+                mem_target = lvl5 if lvl5 is not None else lvl15
+
     if side == "BUY":
-        lvl5  = nearest_level_above(df5,  entry,  LOOKBACK_5M)
-        lvl15 = nearest_level_above(df15, entry,  LOOKBACK_15M)
-        if (lvl5 is not None) and (lvl15 is not None):
-            target = min(lvl5, lvl15)
-        else:
-            target = lvl5 if lvl5 is not None else lvl15
-        if (target is None) or (target <= entry):
+        if mem_target is None or mem_target <= entry:
+            # fallback — половина расстояния до hi15, но не ниже минимального TP
             target = max(entry + max(entry - sl, 1e-9)*0.8, entry + TP_MIN_ABS.get(symbol,0.0))
-        tp = target + buf  # компенсация спреда BUY
-    else:
-        lvl5  = nearest_level_below(df5,  entry,  LOOKBACK_5M)
-        lvl15 = nearest_level_below(df15, entry,  LOOKBACK_15M)
-        if (lvl5 is not None) and (lvl15 is not None):
-            target = max(lvl5, lvl15)
         else:
-            target = lvl5 if lvl5 is not None else lvl15
-        if (target is None) or (target >= entry):
-            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol, 0.0))
-        tp = target - buf  # компенсация спреда SELL
+            target = mem_target
+        tp = target + buf  # компенсация спреда
+    else:
+        if mem_target is None or mem_target >= entry:
+            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol,0.0))
+        else:
+            target = mem_target
+        tp = target - buf
 
     tp_abs = abs(tp - entry)
     tp_min = TP_MIN_ABS.get(symbol, 0.0)
@@ -548,14 +632,28 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
 
-    # скоринг уверенности (без RR/ATR)
+    # ===== Уверенность (Conf) =====
     score = 0
-    if fvg_ok or cons_break: score += 25
+    if fvg_ok or cons_break: score += 20
     if sweep15:              score += 20
     if (side=="BUY" and choch_up) or (side=="SELL" and choch_down): score += 15
     if inside_higher_ob(df5, df60) or inside_higher_ob(df5, df240): score += 10
     if _in_session_utc(): score += 5
     if rr <= 1.0: score += 10
+
+    # бонус за «совпадение»: если TP близко к swing 15m/60m — уровень сильнее
+    if side == "BUY":
+        if abs(tp - hi15) <= 2*buf: score += 10
+    else:
+        if abs(tp - lo15) <= 2*buf: score += 10
+
+    # бонус за «плотность памяти» вокруг TP — много уровней в коридоре => цель реальнее
+    mem = state["levels"].get(symbol, [])
+    if mem:
+        near = [L for L in mem if abs(L["price"] - tp) <= (3*LEVEL_DEDUP_TOL.get(symbol,0.003))]
+        score += min(15, 3 * len(near))
+
+    # золото и DXY противофаза
     if symbol == "XAU" and dxy_bias:
         if side == "BUY"  and dxy_bias == "DOWN": score += 10
         if side == "SELL" and dxy_bias == "UP":   score += 10
@@ -623,20 +721,27 @@ def can_send_idea(sym: str) -> bool:
     return True
 
 def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
-    # защита от устаревшей цены: «не дальше 15*спреда»
+    # антистарьё
     buf = SPREAD_BUFFER.get(symbol, 0.0)
     lim = 15.0 * buf
     return abs(float(entry) - float(close_now)) <= lim
 
+def is_duplicate_signal(symbol: str, entry: float) -> bool:
+    """Антидубли: не спамим сигналами «+пара пунктов от того же места»."""
+    lastp = _last_signal_price.get(symbol)
+    if lastp is None: return False
+    tol = 8.0 * SPREAD_BUFFER.get(symbol, 0.0)
+    return abs(float(entry) - float(lastp)) <= tol
+
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
-    global last_seen_idx, last_signal_idx
+    global last_seen_idx, last_signal_idx, _last_signal_price
 
     # AUTO: NG+XAU; ручной — только выбранный
     if mode != "AUTO" and symbol not in (mode,):
         return
 
     df = await get_df(session, symbol)
-    if df.empty or len(df) < 200:
+    if df.empty or len(df) < 240:
         return
 
     cur_idx = len(df) - 1
@@ -677,7 +782,6 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
 
     if last_signal_idx[symbol] == closed_idx:
         return
-    last_signal_idx[symbol] = closed_idx
 
     buffer    = dynamic_buffer(symbol)
     conf_thr  = CONF_MIN_TRADE.get(symbol, 0.55)
@@ -687,7 +791,10 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
 
     if not is_fresh_enough(symbol, entry, close_now):
         return
+    if is_duplicate_signal(symbol, entry):
+        return
 
+    # IDEA
     if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
@@ -695,6 +802,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
 
+    # TRADE
     if conf >= conf_thr and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
         trade[symbol] = {
@@ -705,6 +813,8 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
             "opened_at": time.time(),
             "entry_bar_idx": cur_idx,
         }
+        last_signal_idx[symbol] = closed_idx
+        _last_signal_price[symbol] = entry
 
 async def engine_loop():
     async with aiohttp.ClientSession() as session:
@@ -748,9 +858,14 @@ async def alive_loop():
             state["atr_XAU"] = rnd("XAU", a_xau)
             state["atr_BTC"] = rnd("BTC", a_btc)
 
-            msg = (f"[ALIVE] NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} | "
-                   f"XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)} | "
-                   f"BTC: {rnd('BTC',c_btc)}, ATR15: {rnd('BTC',a_btc)}. Status: OK.")
+            # уровень памяти (для диагностики): сколько уровней держим по каждому символу
+            Lng = len(state["levels"]["NG"])
+            Lxa = len(state["levels"]["XAU"])
+            Lbt = len(state["levels"]["BTC"])
+
+            msg = (f"[ALIVE] NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} (mem:{Lng}) | "
+                   f"XAU: {rnd('XAU',c_xau)}, ATR15: {rnd('XAU',a_xau)} (mem:{Lxa}) | "
+                   f"BTC: {rnd('BTC',c_btc)}, ATR15: {rnd('BTC',a_btc)} (mem:{Lbt}). Status: OK.")
             await send_log(msg)
         except Exception as e:
             await send_log(f"[ALIVE ERROR] {e}")
@@ -768,5 +883,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-
-

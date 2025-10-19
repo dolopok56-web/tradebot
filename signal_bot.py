@@ -24,42 +24,42 @@ OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
-# tf в подписи сигнала; сами данные берём 1m и ресемплим
+# tf в подписи сигнала; данные берём 1m и ресемплим
 SYMBOLS = {
-    "BTC": {"name": "BTC-USD",   "tf": "5m"},   # BTC включаешь вручную /биток
-    "NG":  {"name": "NATGAS (NG=F)","tf": "1m"},
-    "XAU": {"name": "GOLD (XAUUSD=X)","tf": "1m"},
+    "BTC": {"name": "BTC-USD",         "tf": "5m"},  # BTC включаешь вручную («биток»)
+    "NG":  {"name": "NATGAS (NG=F)",   "tf": "1m"},
+    "XAU": {"name": "GOLD (XAUUSD=X)", "tf": "1m"},
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
-# чистые спред-буферы (для SL и TP компенсации)
+# спред-буферы (для SL и компенсации в TP)
 SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
 
-# минимальная реальная дистанция TP (чтобы цель не была микроскопической)
+# минимальная дистанция TP (чтобы не было микротейков)
 TP_MIN_ABS = {"NG": 0.0080, "XAU": 0.80, "BTC": 25.0}
 
-# требования по уверенности (BTC можешь поднять до 0.70 при желании)
+# требования по уверенности
 CONF_MIN_TRADE = {"NG": 0.42, "XAU": 0.55, "BTC": 0.55}
 CONF_MIN_IDEA  = 0.05
 
-# RR-фильтров нет (используем 0 просто для отображения)
+# RR-фильтров нет (оставлены нули для отображения)
 RR_TRADE_MIN = 0.0
 RR_MIN_IDEA  = 0.0
 
-# антиспам идей отключён (идея = 0 кулдаун); новый сигнал только без открытой сделки
+# антиспам идей выключен (новая IDEA можно сразу, если нет сделки)
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
 MAX_IDEAS_PER_HOUR = 60
 
-# торговые окна — просто как маленький бонус к скору
+# сессии — лёгкий бонус к скору (не блокируют)
 LONDON_HOURS = range(7, 15)
 NY_HOURS     = range(12, 21)
 
-# скорость и интервалы
+# скорость/интервалы
 POLL_SEC        = 1
 ALIVE_EVERY_SEC = 300
 BOOT_COOLDOWN_S = 20
-COOLDOWN_SEC    = 7
+COOLDOWN_SEC    = 7  # можешь поставить 0, если хочешь «без паузы»
 
 TRADES_CSV = "gv_trades.csv"
 
@@ -419,7 +419,6 @@ def inside_higher_ob(df_low, df_high):
 
 def nearest_level_above(df: pd.DataFrame, price: float, lookback: int = 30) -> float | None:
     if df is None or df.empty: return None
-    # берём пики выше цены и выбираем ближайший
     highs = df["High"].tail(lookback)
     candidates = highs[highs > price]
     if candidates.empty: return None
@@ -437,7 +436,6 @@ def dxy_bias_from_df(dxy_1m: pd.DataFrame) -> str|None:
     df60 = _resample(dxy_1m, 60)
     df240 = _resample(dxy_1m, 240)
     if df60.empty or df240.empty: return None
-    # простой BOS
     c1 = float(df60["Close"].iloc[-2])
     hh4 = _swing_high(df240, 20); ll4=_swing_low(df240,20)
     if c1 > hh4: return "UP"
@@ -503,54 +501,52 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     hi15  = _swing_high(df15, 20)
     if side == "BUY":
         sl = min(entry, lo15 - buf)
+        # safety: SL должен быть ниже entry
+        if sl >= entry:
+            sl = entry - max(buf*1.2, 1e-6)
     else:
         sl = max(entry, hi15 + buf)
+        # safety: SL должен быть выше entry
+        if sl <= entry:
+            sl = entry + max(buf*1.2, 1e-6)
 
-    # TP: до БЛИЖАЙШЕГО значимого уровня (NO-ATR)
-    # ищем уровень на 5m (ближайший) и на 15m (подстраховка), берём ближайший по цене
+    # TP: ближайший значимый уровень (NO-ATR) + компенсация спреда
     if side == "BUY":
         lvl5  = nearest_level_above(df5,  entry,  36)
         lvl15 = nearest_level_above(df15, entry,  36)
-        target = None
-        if lvl5 is not None and lvl15 is not None:
+        if (lvl5 is not None) and (lvl15 is not None):
             target = min(lvl5, lvl15)
         else:
             target = lvl5 if lvl5 is not None else lvl15
-        # если уровней выше нет — возьмём половину расстояния до hi15 (чтобы цель была реальная)
-        if target is None or target <= entry:
+        if (target is None) or (target <= entry):
             target = max(entry + max(entry - sl, 1e-9)*0.8, entry + TP_MIN_ABS.get(symbol,0.0))
-        tp = target + buf  # компенсация спреда для BUY
+        tp = target + buf  # компенсация спреда BUY
     else:
         lvl5  = nearest_level_below(df5,  entry,  36)
         lvl15 = nearest_level_below(df15, entry,  36)
-        target = None
-        if lvl5 is not None and lvl15 is not None:
+        if (lvl5 is not None) and (lvl15 is not None):
             target = max(lvl5, lvl15)
         else:
             target = lvl5 if lvl5 is not None else lvl15
-        if target is None or target >= entry:
+        if (target is None) or (target >= entry):
             target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol,0.0))
-        tp = target - buf  # компенсация спреда для SELL
+        tp = target - buf  # компенсация спреда SELL
 
     tp_abs = abs(tp - entry)
     tp_min = TP_MIN_ABS.get(symbol, 0.0)
     if tp_abs < tp_min:
-        # не торгуем микродвижение
         return None
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
 
     # скоринг уверенности (без RR/ATR)
     score = 0
-    # базовые «глаза»
     if fvg_ok or cons_break: score += 25
     if sweep15:              score += 20
     if (side=="BUY" and choch_up) or (side=="SELL" and choch_down): score += 15
     if inside_higher_ob(df5, df60) or inside_higher_ob(df5, df240): score += 10
     if _in_session_utc(): score += 5
-    # лёгкий бонус, если TP недалеко (быстрый профит)
     if rr <= 1.0: score += 10
-    # золото с DXY (противофаза)
     if symbol == "XAU" and dxy_bias:
         if side == "BUY"  and dxy_bias == "DOWN": score += 10
         if side == "SELL" and dxy_bias == "UP":   score += 10
@@ -618,7 +614,7 @@ def can_send_idea(sym: str) -> bool:
     return True
 
 def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
-    # без строгих ограничений — просто не допускаем «сигнал по старой цене»
+    # защита от устаревшей цены: «не дальше 15*спреда»
     buf = SPREAD_BUFFER.get(symbol, 0.0)
     lim = 15.0 * buf
     return abs(float(entry) - float(close_now)) <= lim
@@ -763,5 +759,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-
-

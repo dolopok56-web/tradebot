@@ -36,7 +36,7 @@ DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 SPREAD_BUFFER = {"NG": 0.0020, "XAU": 0.20, "BTC": 5.0}
 
 # минимальная реальная дистанция TP (чтобы цель не была микроскопической)
-TP_MIN_ABS = {"NG": 0.0100, "XAU": 0.80, "BTC": 25.0}
+TP_MIN_ABS = {"NG": 0.0080, "XAU": 0.80, "BTC": 25.0}
 
 # требования по уверенности (BTC можешь поднять до 0.70 при желании)
 CONF_MIN_TRADE = {"NG": 0.42, "XAU": 0.55, "BTC": 0.55}
@@ -763,4 +763,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

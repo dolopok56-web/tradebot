@@ -15,7 +15,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V7.2 Human-Pro+Scalp (SMC/MTF, memory, NO-ATR, structural TP/SL, anti-dup, 1s, BTC manual, NG scalp)"
+VERSION = "V7.4 NG-30P Human-Pro (SMC/MTF, memory, 30-pip TP, structural SL, anti-dup, NG only by default, Yahoo feeds)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -23,46 +23,35 @@ LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "8073073724:AAHGuUPg9s_oRsH24CpLUu-
 OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
-TWELVE_KEY = os.getenv("TWELVE_KEY", "970c6f5c89b64abcb2f1a32c2601e592")
-TWELVE_BASE = "https://api.twelvedata.com/time_series"
-
 # ===================== MARKETS / SETTINGS =====================
-# tf в подписи сигнала; сами данные берём 1m и ресемплим
 SYMBOLS = {
-    "BTC": {"name": "BTC-USD",          "tf": "5m"},   # BTC вручную
-    "NG":  {"name": "NATGAS (NG=F)",    "tf": "1m"},
+    "BTC": {"name": "BTC-USD",          "tf": "5m"},   # BTC manual
+    "NG":  {"name": "NATGAS (NG=F)",    "tf": "1m"},   # focus
     "XAU": {"name": "GOLD (XAUUSD=X)",  "tf": "1m"},
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
-# Спред-буферы (для SL и компенсации TP) — под твой спред ~0.004 на NG
+# Spread buffer (compensate broker spread/slippage)
 SPREAD_BUFFER = {"NG": 0.0040, "XAU": 0.20, "BTC": 5.0}
 
-# Минимальная реальная дистанция TP (без микродвижений)
-TP_MIN_ABS = {"NG": 0.0100, "XAU": 0.80, "BTC": 25.0}   # NG минимум 0.010
-
-# Порог уверенности
-CONF_MIN_TRADE = {"NG": 0.45, "XAU": 0.55, "BTC": 0.55}
+# === 30-pip target for NG ===
+TP_MIN_ABS = {"NG": 0.0300, "XAU": 0.80, "BTC": 25.0}   # NG hard = 30 pips
+CONF_MIN_TRADE = {"NG": 0.50, "XAU": 0.55, "BTC": 0.55}
 CONF_MIN_IDEA  = 0.05
 
-# RR-фильтров нет (оставлены 0 — только отображение)
-RR_TRADE_MIN = 0.0
-RR_MIN_IDEA  = 0.0
-
-# Идеи
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
-MAX_IDEAS_PER_HOUR = 120
+MAX_IDEAS_PER_HOUR = 60
 
-# Торговые окна — лёгкий бонус к скору
+# Sessions bonus windows (UTC-based check)
 LONDON_HOURS = range(7, 15)
 NY_HOURS     = range(12, 21)
 
-# Скорость и интервалы
-POLL_SEC        = 0.2
+# Speeds & intervals
+POLL_SEC        = 0.3
 ALIVE_EVERY_SEC = 300
-BOOT_COOLDOWN_S = 15
-COOLDOWN_SEC    = 0    # без паузы после SL в обычных режимах
+BOOT_COOLDOWN_S = 12
+COOLDOWN_SEC    = 0
 
 TRADES_CSV = "gv_trades.csv"
 
@@ -79,17 +68,24 @@ ROBUST_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# ====== SCALP (NG) ======
-SCALP_MODE_ENABLED = True
-SCALP_SYMBOL       = "NG"
-SCALP_TF_LABEL     = "1m"           # подпись в сигнале
-SCALP_TP_ABS       = 0.0100         # 10 пипсов
-SCALP_SL_ABS       = 0.0070         # 7 пипсов
-SCALP_MIN_IMPULSE  = 0.0040         # мин. диапазон свечи 1m (High-Low) — «толчок»
-SCALP_MIN_BODY     = 0.0020         # мин. тело свечи (abs(Close-Open))
-SCALP_NEAR_BREAK   = 0.0015         # близость к пробою экстремума толчковой свечи
-SCALP_COOLDOWN_SEC = 1             # кулдаун после сделки (скорость)
-SCALP_MAX_PER_HOUR = 12             # ограничение частоты
+# ====== DAILY LIMITS ======
+MAX_TRADES_PER_DAY = {"NG": 5, "XAU": 3, "BTC": 0}
+_trades_today_key = ""
+_trades_today = {"NG": 0, "XAU": 0, "BTC": 0}
+
+# ====== NG 30-pip entry (pullback → micro-break) ======
+NG_M1_ATR_MIN   = 0.0050      # need some vol to attempt 30 pips
+NG_M1_TP_ABS    = 0.0300      # hard 30 pips target
+NG_M1_SL_MIN    = 0.0120      # never tighter than 12 pips
+NG_M1_SL_ATR_K  = 0.35        # SL padding by ATR(M1)
+NG_M1_SL_MAX    = 0.0220      # cap SL so RR stays ok
+NG_M1_EMA_FAST  = 20
+NG_M1_EMA_SLOW  = 50
+NG_IMPULSE_MIN  = 0.0060      # last impulse (H-L) in recent bars to confirm life
+NG_RECENT_BARS  = 8           # lookback to find an impulse bar
+
+# ====== SCALP MODE (disabled) ======
+SCALP_MODE_ENABLED = False
 
 # ===================== STATE =====================
 boot_ts = time.time()
@@ -108,20 +104,16 @@ _last_signal_price = {"NG": None, "XAU": None, "BTC": None}
 
 _prices_cache = {}
 state = {
-    "levels": {"NG": [], "XAU": [], "BTC": []},  # память уровней
+    "levels": {"NG": [], "XAU": [], "BTC": []},
+    "atr_NG": 0.0, "atr_XAU": 0.0, "atr_BTC": 0.0
 }
-mode = "AUTO"          # AUTO: NG + XAU; BTC — вручную
-requested_mode = "AUTO"
+mode = "NG"           # default focus on NATGAS
+requested_mode = "NG"
 
-# Параметры памяти уровней (сколько часов смотрим на ТФ)
+# Level memory params
 LEVEL_MEMORY_HOURS = {"5m": 72, "15m": 72, "60m": 120}
 LEVEL_DEDUP_TOL    = {"NG": 0.003, "XAU": 0.30, "BTC": 8.0}
 LEVEL_EXPIRE_SEC   = 48 * 3600
-
-# Скальп-состояние
-scalp_cooldown_until = 0.0
-scalp_trades_hour_ts = 0.0
-scalp_trades_hour_ct = 0
 
 # ===================== TELEGRAM =====================
 router = Router()
@@ -146,8 +138,7 @@ def mode_title(m: str) -> str:
     return {"BTC": "BITCOIN (BTC-USD)",
             "NG": "NATGAS (NG=F)",
             "XAU": "GOLD (XAUUSD=X)",
-            "AUTO": "NATGAS+GOLD (AUTO)",
-            "SCALP": "SCALP NG (1m)"} .get(m, m)
+            "AUTO": "NATGAS+GOLD (AUTO)"} .get(m, m)
 
 async def _request_mode(new_mode: str, m: Message | None = None):
     global requested_mode, mode
@@ -167,16 +158,12 @@ async def cmd_help(m: Message):
         "📋 Команды:\n"
         "• /start — запуск\n"
         "• команды — список\n"
-        "• биток / газ / золото / авто — выбор рынка\n"
-        "• скальп — включить скальпинг NG (1m, TP 0.010 / SL 0.007)\n"
+        "• газ / золото / авто — выбор рынка (BTC вручную)\n"
         "• стоп — стоп и короткий кулдаун\n"
         "• статус — диагностика\n"
         "• отчет — 10 последних закрытий (только владелец)\n"
         "• тест — тестовый сигнал"
     )
-
-@router.message(F.text.lower() == "биток")
-async def set_btc(m: Message): await _request_mode("BTC", m)
 
 @router.message(F.text.lower() == "газ")
 async def set_ng(m: Message):  await _request_mode("NG", m)
@@ -187,28 +174,19 @@ async def set_xau(m: Message): await _request_mode("XAU", m)
 @router.message(F.text.lower() == "авто")
 async def set_auto(m: Message): await _request_mode("AUTO", m)
 
-@router.message(F.text.lower() == "скальп")
-async def set_scalp(m: Message):
-    global requested_mode, mode
-    requested_mode = "SCALP"
-    mode = "SCALP"
-    await m.answer("✅ Режим SCALP: скальпинг NG (1m, TP 0.010, SL 0.007).")
-
 @router.message(F.text.lower() == "стоп")
 async def cmd_stop(m: Message):
     now = time.time()
     for s in trade.keys():
         trade[s] = None
         cooldown_until[s] = now + 3
-    global scalp_cooldown_until
-    scalp_cooldown_until = now + 10
     await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
 
 @router.message(F.text.lower() == "статус")
 async def cmd_status(m: Message):
     now = time.time()
     lines = [f"mode: {mode} (requested: {requested_mode})",
-             f"alive: OK | idea_cooldown={IDEA_COOLDOWN_SEC}s | poll={POLL_SEC}s"]
+             f"alive: OK | poll={POLL_SEC}s | daily_limits: {MAX_TRADES_PER_DAY} | today: {_trades_today}"]
     for s in ["BTC","NG","XAU"]:
         opened = bool(trade[s])
         age = int(now - last_candle_close_ts[s]) if last_candle_close_ts[s] else -1
@@ -217,9 +195,6 @@ async def cmd_status(m: Message):
         cd = max(0, int(cooldown_until[s]-now))
         L = len(state["levels"][s]) if isinstance(state.get("levels",{}).get(s), list) else 0
         lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s  levels_mem={L}")
-    if mode == "SCALP":
-        scd = max(0, int(scalp_cooldown_until - now))
-        lines.append(f"SCALP: tp={SCALP_TP_ABS} sl={SCALP_SL_ABS}  cooldown={scd}s  per_hour={scalp_trades_hour_ct}")
     await m.answer("```\n"+ "\n".join(lines) + "\n```")
 
 @router.message(F.text.lower() == "отчет")
@@ -240,10 +215,10 @@ async def cmd_report(m: Message):
 @router.message(F.text.lower() == "тест")
 async def cmd_test(m: Message):
     text = (
-        "🔥 BUY BTC-USD | 5m\n"
-        "✅ TP: **114999.9**\n"
-        "🟥 SL: **114111.1**\n"
-        "Entry: 114555.5  Spread≈5.0  Conf: 72%  Bias: UP"
+        "🔥 BUY NATGAS (NG=F) | 1m\n"
+        "✅ TP: **2.9999**\n"
+        "🟥 SL: **2.9700**\n"
+        "Entry: 2.9699  Spread≈0.0040  Conf: 60%  Bias: UP"
     )
     await m.answer(text)
 
@@ -311,26 +286,24 @@ async def _get_df_stooq_1m(session, stooq_code: str) -> pd.DataFrame:
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     now_ts = time.time()
     c = _prices_cache.get(symbol)
-    cache_ttl = 0.3  # более частое обновление
+    cache_ttl = 0.35
     if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
 
-    # --- Twelve Data NG ---
     if symbol == "NG":
-        url = f"{TWELVE_BASE}?symbol=NG=F&interval=1min&apikey={TWELVE_KEY}&outputsize=300"
-        try:
-            async with session.get(url, timeout=HTTP_TIMEOUT) as r:
-                data = await r.json()
-                if "values" in data:
-                    df = pd.DataFrame(data["values"])
-                    df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"})
-                    df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
-                    df = df.iloc[::-1].reset_index(drop=True)  # реверс
-                    last_candle_close_ts["NG"] = time.time()
-                    _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"twelve"}
-                    return df
-        except:
-            return pd.DataFrame()
+        for t in ("NG=F",):
+            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"))
+            if not df.empty:
+                last_candle_close_ts["NG"] = time.time()
+                _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
+                return df
+        for s in ("ng.f",):
+            df = await _get_df_stooq_1m(session, s)
+            if not df.empty:
+                last_candle_close_ts["NG"] = time.time()
+                _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"stooq"}
+                return df
+        return pd.DataFrame()
 
     if symbol == "XAU":
         for t in ("XAUUSD%3DX", "GC%3DF"):
@@ -365,7 +338,7 @@ async def get_dxy_df(session: aiohttp.ClientSession) -> pd.DataFrame:
             return df
     return pd.DataFrame()
 
-# ===================== SMC / MTF UTILS =====================
+# ===================== UTILS / SMC =====================
 def rnd(sym: str, x: float) -> float:
     if sym == "NG":  return round(float(x), 4)
     if sym == "XAU": return round(float(x), 2)
@@ -399,6 +372,28 @@ def _swing_low(df, lookback=20):
 def _in_session_utc():
     h = pd.Timestamp.utcnow().hour
     return (h in LONDON_HOURS) or (h in NY_HOURS)
+
+def _ema_series(values, period):
+    k = 2.0/(period+1.0)
+    ema = None
+    out = []
+    for v in values:
+        if ema is None: ema = v
+        else: ema = v*k + ema*(1.0-k)
+        out.append(ema)
+    return out
+
+def _atr_m(df: pd.DataFrame, period: int = 14) -> float:
+    if df is None or df.empty or len(df) < period+2: return 0.0
+    highs = df["High"].values
+    lows  = df["Low"].values
+    closes= df["Close"].values
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    if len(trs) < period: return 0.0
+    return float(sum(trs[-period:]) / period)
 
 def fvg_last_soft(df: pd.DataFrame, lookback: int = 20, use_bodies: bool = True):
     n = len(df)
@@ -441,18 +436,6 @@ def had_liquidity_sweep(df, lookback=20):
     if H > hh and C < hh: return True, "DOWN"
     if L < ll and C > ll: return True, "UP"
     return False, ""
-
-def is_consolidation_break(df):
-    if df is None or df.empty or len(df) < 20: return False
-    i = len(df) - 2
-    window = df.iloc[i-12:i].copy()
-    rng = float((window["High"].max() - window["Low"].min()) or 0.0)
-    base = float(window["Close"].iloc[-1])
-    if base <= 0: return False
-    if (rng / base) <= 0.003:
-        H = float(df["High"].iloc[i]); L = float(df["Low"].iloc[i])
-        return H > window["High"].max() or L < window["Low"].min()
-    return False
 
 def inside_higher_ob(df_low, df_high):
     if df_low is None or df_low.empty or df_high is None or df_high.empty: return False
@@ -560,7 +543,106 @@ def format_signal(setup, buffer):
         f"RR≈{round(rr,2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
-# ===================== BUILD SETUP (MEMORY-LEVEL TP/SL) =====================
+# ===================== NG-30P ENTRY BUILDER =====================
+def _atr_m1(df1m: pd.DataFrame, period: int = 14) -> float:
+    return _atr_m(df1m, period)
+
+def _has_recent_impulse(df1m: pd.DataFrame) -> bool:
+    n = len(df1m)
+    lo = max(2, n - NG_RECENT_BARS - 1)
+    window = df1m.iloc[lo:n-1]
+    if window.empty: return False
+    rng = (window["High"] - window["Low"]).max()
+    return float(rng) >= NG_IMPULSE_MIN
+
+def build_entry_ng_30pip(df1m: pd.DataFrame) -> dict | None:
+    """
+    Bias M5: EMA20 > EMA50 (BUY) / EMA20 < EMA50 (SELL).
+    Trigger M1: pullback into EMA20–EMA50 zone and close breaks prev high/low.
+    TP: fixed 0.0300 (+spread); SL: swing ± max(NG_M1_SL_MIN, NG_M1_SL_ATR_K*ATR1) (clamped to NG_M1_SL_MAX).
+    """
+    if df1m is None or df1m.empty or len(df1m) < 180:
+        return None
+
+    # Bias on M5
+    df5 = _resample(df1m, 5)
+    if df5.empty or len(df5) < NG_M1_EMA_SLOW*2:
+        return None
+    c5 = df5["Close"].values
+    ema20_5 = _ema_series(list(c5), NG_M1_EMA_FAST)[-1]
+    ema50_5 = _ema_series(list(c5), NG_M1_EMA_SLOW)[-1]
+    if ema20_5 is None or ema50_5 is None:
+        return None
+    bias = "UP" if ema20_5 > ema50_5 else ("DOWN" if ema20_5 < ema50_5 else "NONE")
+    if bias == "NONE":
+        return None
+
+    # M1 trigger
+    closes = df1m["Close"].values
+    highs  = df1m["High"].values
+    lows   = df1m["Low"].values
+    ema20_1 = _ema_series(list(closes), NG_M1_EMA_FAST)
+    ema50_1 = _ema_series(list(closes), NG_M1_EMA_SLOW)
+    if len(ema20_1) < 2 or len(ema50_1) < 2:
+        return None
+
+    # Require some vol and recent impulse
+    atr1 = _atr_m1(df1m, 14)
+    if atr1 < NG_M1_ATR_MIN:
+        return None
+    if not _has_recent_impulse(df1m):
+        return None
+
+    i = len(closes) - 1  # last closed
+    prev_h = float(highs[i-1]); prev_l = float(lows[i-1])
+    c_now  = float(closes[i]);  c_prev = float(closes[i-1])
+    e20 = float(ema20_1[i]); e50 = float(ema50_1[i])
+    lo_zone, hi_zone = (min(e20, e50), max(e20, e50))
+    in_zone = (lo_zone <= c_prev <= hi_zone) or (lo_zone <= c_now <= hi_zone)
+    if not in_zone:
+        return None
+
+    buf = SPREAD_BUFFER["NG"]
+    side = None; entry=None; sl=None; tp=None
+
+    if bias == "UP" and c_now > prev_h:
+        side = "BUY"; entry = c_now
+        swing = float(min(lows[i], lows[i-1]))
+        pad = max(NG_M1_SL_MIN, NG_M1_SL_ATR_K * atr1)
+        sl  = swing - pad - buf
+        sl  = min(entry - 1e-6, sl)
+        # clamp SL width
+        if (entry - sl) > NG_M1_SL_MAX: sl = entry - NG_M1_SL_MAX
+        tp  = entry + NG_M1_TP_ABS + buf
+    elif bias == "DOWN" and c_now < prev_l:
+        side = "SELL"; entry = c_now
+        swing = float(max(highs[i], highs[i-1]))
+        pad = max(NG_M1_SL_MIN, NG_M1_SL_ATR_K * atr1)
+        sl  = swing + pad + buf
+        sl  = max(entry + 1e-6, sl)
+        if (sl - entry) > NG_M1_SL_MAX: sl = entry + NG_M1_SL_MAX
+        tp  = entry - NG_M1_TP_ABS - buf
+    else:
+        return None
+
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    conf = 0.6  # fixed confidence for NG-30P trigger
+
+    return {
+        "symbol": "NG",
+        "tf": "1m",
+        "side": side,
+        "trend": "UP" if side=="BUY" else "DOWN",
+        "entry": float(entry),
+        "tp": float(tp),
+        "sl": float(sl),
+        "rr": rr,
+        "conf": conf,
+        "tp_abs": abs(tp - entry),
+        "tp_min": TP_MIN_ABS["NG"]
+    }
+
+# ===================== GENERIC SETUP (fallback for XAU/BTC/AUTO) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
     if df1m is None or df1m.empty or len(df1m) < 240:
         return None
@@ -659,11 +741,6 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
     if _in_session_utc(): score += 5
     if rr <= 1.0: score += 10
 
-    if side == "BUY":
-        if abs(tp - hi15) <= 2*buf: score += 10
-    else:
-        if abs(tp - lo15) <= 2*buf: score += 10
-
     mem = state["levels"].get(symbol, [])
     if mem:
         near = [L for L in mem if abs(L["price"] - tp) <= (3*LEVEL_DEDUP_TOL.get(symbol,0.003))]
@@ -684,89 +761,22 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
         "rr": rr, "conf": conf, "tp_abs": tp_abs, "tp_min": tp_min
     }
 
-# ===================== SCALP BUILDER (NG, 1m) =====================
-def _reset_scalp_hour():
-    global scalp_trades_hour_ts, scalp_trades_hour_ct
-    now = time.time()
-    if now - (scalp_trades_hour_ts or 0.0) >= 3600:
-        scalp_trades_hour_ts = now
-        scalp_trades_hour_ct = 0
+# ===================== DAILY COUNTERS =====================
+def _reset_daily_counters_if_needed():
+    global _trades_today_key, _trades_today
+    today = datetime.utcnow().date().isoformat()
+    if _trades_today_key != today:
+        _trades_today_key = today
+        _trades_today = {"NG": 0, "XAU": 0, "BTC": 0}
 
-def _ok_scalp_frequency() -> bool:
-    _reset_scalp_hour()
-    return scalp_trades_hour_ct < SCALP_MAX_PER_HOUR
+def _allow_new_trade_today(symbol: str) -> bool:
+    _reset_daily_counters_if_needed()
+    lim = MAX_TRADES_PER_DAY.get(symbol, 0)
+    return _trades_today.get(symbol, 0) < lim
 
-def build_scalp_setup_ng(df1m: pd.DataFrame) -> dict | None:
-    """
-    Импульсный скальп по NG на 1m:
-    — ищем последнюю «толчковую» свечу (большой диапазон + тело),
-    — ждём близость цены к пробою High/Low этой свечи,
-    — входим в сторону пробоя,
-    — TP/SL фикс (TP=0.0100, SL=0.0070) + компенсация спреда.
-    """
-    if df1m is None or df1m.empty or len(df1m) < 30:
-        return None
-
-    i = len(df1m) - 1  # последняя закрытая
-    H = float(df1m["High"].iloc[i])
-    L = float(df1m["Low"].iloc[i])
-    O = float(df1m["Open"].iloc[i])
-    C = float(df1m["Close"].iloc[i])
-
-    rng  = H - L
-    body = abs(C - O)
-
-    if (rng < SCALP_MIN_IMPULSE) or (body < SCALP_MIN_BODY):
-        return None
-
-    cur = float(df1m["Close"].iloc[-1])
-    buf = SPREAD_BUFFER.get("NG", 0.0)
-
-    near_up   = (H - cur) <= SCALP_NEAR_BREAK
-    near_down = (cur - L) <= SCALP_NEAR_BREAK
-
-    side = None
-    if near_up and C >= O:
-        side = "BUY"
-    elif near_down and C <= O:
-        side = "SELL"
-    else:
-        return None
-
-    entry = float(df1m["Close"].iloc[-1])
-
-    if side == "BUY":
-        tp = entry + SCALP_TP_ABS + buf
-        sl = entry - SCALP_SL_ABS - buf
-        sl = min(entry - 1e-6, sl)
-    else:
-        tp = entry - SCALP_TP_ABS - buf
-        sl = entry + SCALP_SL_ABS + buf
-        sl = max(entry + 1e-6, sl)
-
-    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-
-    score = 0
-    if body >= SCALP_MIN_BODY: score += 35
-    if rng  >= SCALP_MIN_IMPULSE: score += 35
-    if _in_session_utc(): score += 10
-    if rr <= 1.2: score += 10
-
-    conf = max(0, min(100, score)) / 100.0
-
-    return {
-        "symbol": "NG",
-        "tf": SCALP_TF_LABEL,
-        "side": side,
-        "trend": "UP" if side == "BUY" else "DOWN",
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "rr": rr,
-        "conf": conf,
-        "tp_abs": abs(tp - entry),
-        "tp_min": SCALP_TP_ABS
-    }
+def _mark_trade_opened(symbol: str):
+    _reset_daily_counters_if_needed()
+    _trades_today[symbol] = _trades_today.get(symbol, 0) + 1
 
 # ===================== EXECUTION / LOGGING =====================
 def append_trade(row):
@@ -832,6 +842,7 @@ def is_duplicate_signal(symbol: str, entry: float) -> bool:
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
     global last_seen_idx, last_signal_idx, _last_signal_price
 
+    # which symbols are we running
     if mode != "AUTO" and symbol not in (mode,):
         return
 
@@ -845,6 +856,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         return
     last_seen_idx[symbol] = closed_idx
 
+    # manage open
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))
@@ -866,9 +878,13 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
     if time.time() - boot_ts < BOOT_COOLDOWN_S: return
     if time.time() < cooldown_until[symbol]:   return
 
-    dxy_bias = dxy_df if (symbol=="XAU") else None
-
-    setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"], dxy_bias=dxy_bias)
+    # build setup:
+    setup = None
+    if symbol == "NG" and _allow_new_trade_today("NG"):
+        setup = build_entry_ng_30pip(df)
+    if setup is None:
+        dxy_bias = dxy_df if (symbol=="XAU") else None
+        setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"], dxy_bias=dxy_bias)
     if not setup:
         return
 
@@ -885,7 +901,10 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         return
     if is_duplicate_signal(symbol, entry):
         return
+    if not _allow_new_trade_today(symbol):
+        return
 
+    # optional idea ping
     if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
@@ -893,6 +912,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
 
+    # entry
     if conf >= conf_thr and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
         trade[symbol] = {
@@ -905,83 +925,19 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         }
         last_signal_idx[symbol] = closed_idx
         _last_signal_price[symbol] = entry
-
-async def handle_scalp_ng(session: aiohttp.ClientSession):
-    global trade, scalp_cooldown_until, scalp_trades_hour_ct
-
-    if mode != "SCALP" or not SCALP_MODE_ENABLED:
+        _mark_trade_opened(symbol)
         return
-
-    df = await get_df(session, "NG")
-    if df.empty or len(df) < 30:
-        return
-
-    if trade["NG"]:
-        sess = trade["NG"]
-        # читаем все бары, включая текущий
-        start_i = int(sess.get("entry_bar_idx", len(df)-1))
-        post = df.iloc[start_i:]
-
-        if not post.empty:
-            side = sess["side"]; tp = sess["tp"]; sl = sess["sl"]
-            hit_tp = (post["High"].max() >= tp) if side=="BUY" else (post["Low"].min() <= tp)
-            hit_sl = (post["Low"].min()  <= sl) if side=="BUY" else (post["High"].max() >= sl)
-            if hit_tp:
-                price_now = float(post["Close"].iloc[-1])
-                asyncio.create_task(notify_outcome("NG", "TP", price_now))
-                finish_trade("NG", "TP", price_now)
-                scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
-                return
-            if hit_sl:
-                price_now = float(post["Close"].iloc[-1])
-                asyncio.create_task(notify_outcome("NG", "SL", price_now))
-                finish_trade("NG", "SL", price_now)
-                scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
-                return
-        return
-
-    if time.time() < scalp_cooldown_until:
-        return
-    if time.time() - boot_ts < BOOT_COOLDOWN_S:
-        return
-    if not _ok_scalp_frequency():
-        return
-
-    setup = build_scalp_setup_ng(df)
-    if not setup:
-        return
-
-    buf = SPREAD_BUFFER.get("NG", 0.0)
-    close_now = float(df["Close"].iloc[-1])
-    if abs(setup["entry"] - close_now) > 15.0 * buf:
-        return
-
-    await send_main(format_signal(setup, buf))
-    trade["NG"] = {
-        "side": setup["side"],
-        "entry": float(setup["entry"]),
-        "tp": float(setup["tp"]),
-        "sl": float(setup["sl"]),
-        "opened_at": time.time(),
-        "entry_bar_idx": len(df)-1,
-    }
-    scalp_trades_hour_ct += 1
-    # локальный кулдаун после открытия, чтобы не заспамить
-    scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
 
 async def engine_loop():
     async with aiohttp.ClientSession() as session:
         dxy_df = None; dxy_ts = 0.0
         while True:
             try:
-                if mode == "SCALP":
-                    await handle_scalp_ng(session)
-                else:
-                    if time.time() - dxy_ts > 25:
-                        dxy_df = await get_dxy_df(session); dxy_ts = time.time()
-                    symbols_to_run = ("NG","XAU") if mode == "AUTO" else (mode,)
-                    for s in symbols_to_run:
-                        await handle_symbol(session, s, dxy_df)
+                if time.time() - dxy_ts > 25:
+                    dxy_df = await get_dxy_df(session); dxy_ts = time.time()
+                symbols_to_run = ("NG","XAU") if mode == "AUTO" else (mode,)
+                for s in symbols_to_run:
+                    await handle_symbol(session, s, dxy_df)
                 await asyncio.sleep(POLL_SEC)
             except Exception as e:
                 logging.error(f"engine error: {e}")
@@ -1038,6 +994,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-
-
-

@@ -12,7 +12,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V7.7 NG Human + Assist (NG-only, MTF levels, Yahoo 1m, ATR1>=0.004, TP 0.020 / SL 0.012, no daily cap)"
+VERSION = "V7.8 NG Human + Assist (NG-only, level memory fixed+seed, Yahoo 1m, ATR1>=0.004, TP 0.020 / SL 0.012)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -33,7 +33,7 @@ TP_MIN_ABS = {"NG": 0.0150}
 CONF_MIN_TRADE = {"NG": 0.50}
 CONF_MIN_IDEA  = 0.05
 
-# Идеи (в чат «🧠 IDEA», если сетап годится, но уверенность ниже порога на вход)
+# Идеи
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
 MAX_IDEAS_PER_HOUR = 60
@@ -101,6 +101,7 @@ requested_mode = "NG"
 LEVEL_MEMORY_HOURS = {"5m": 72, "15m": 72, "60m": 120}
 LEVEL_DEDUP_TOL    = {"NG": 0.003}
 LEVEL_EXPIRE_SEC   = 48 * 3600
+LEVEL_SEED_BARS    = 400     # сколько минуток используем для «посева» при пустой памяти
 
 # Assist counters
 scalp_cooldown_until = 0.0
@@ -190,8 +191,12 @@ async def cmd_status(m: Message):
     atrtxt = state.get("atr_NG", "—")
     nm = SYMBOLS[s]["name"]
     cd = max(0, int(cooldown_until[s]-now))
-    L = len(state["levels"][s]) if isinstance(state["levels"].get(s), list) else 0
-    lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s  levels_mem={L}")
+    L = state["levels"].get(s, [])
+    Lcnt = len(L) if isinstance(L, list) else 0
+    sample = ", ".join(f"{rnd('NG',x['price'])}" for x in (L[:5] if L else []))
+    lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s  levels_mem={Lcnt}")
+    if Lcnt:
+        lines.append(f"levels_sample: [{sample}]")
     lines.append(f"Assist: {'ON' if SCALP_ASSIST_ENABLED else 'OFF'} (TP=0.020, SL=0.012, ATR1>=0.004)")
     scd = max(0, int(scalp_cooldown_until - now))
     lines.append(f"Assist stats: cooldown={scd}s  per_hour={scalp_trades_hour_ct}")
@@ -317,8 +322,7 @@ def rnd(sym: str, x: float) -> float:
 def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    # строим ИСКУССТВЕННЫЙ равномерный минутный индекс, заканчивающийся текущей минутой,
-    # чтобы resample всегда работал стабильно
+    # равномерный минутный индекс до текущей минуты — чтобы resample был стабильным
     end = pd.Timestamp.utcnow().floor("min")
     idx = pd.date_range(end - pd.Timedelta(minutes=len(df)-1), periods=len(df), freq="1min")
     z = df.copy()
@@ -330,7 +334,6 @@ def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     r = pd.concat([o,h,l,c], axis=1).dropna()
     r.columns = ["Open","High","Low","Close"]
     return r.reset_index(drop=True)
-
 
 def _swing_high(df, lookback=20):
     i = len(df) - 2
@@ -437,24 +440,33 @@ def _dedup_level_list(levels: list, tol: float) -> list:
             out.append(L)
     return out
 
+# --- ключевая правка: уровни с допуском по float ---
 def extract_levels(df: pd.DataFrame, tf_label: str, lookback_hours: int, now_ts: float, kind: str) -> list:
-    if df is None or df.empty: return []
+    if df is None or df.empty:
+        return []
     bars = _bars_for_hours(tf_label, lookback_hours)
-    d = df.tail(max(bars, 30)).copy()
+    d = df.tail(max(bars, 50)).copy()
     out = []
     n = len(d)
-    if n < 10: return out
-    k = 3
-    for i in range(k, n-k):
-        hi = float(d["High"].iloc[i]); lo = float(d["Low"].iloc[i])
+    if n < 10:
+        return out
+
+    tol = 5e-4  # допуск для NG
+    k = 3       # ширина окна локального экстремума
+    for i in range(k, n - k):
+        hi = float(d["High"].iloc[i])
+        lo = float(d["Low"].iloc[i])
+        winH = float(d["High"].iloc[i-k:i+k+1].max())
+        winL = float(d["Low"].iloc[i-k:i+k+1].min())
         if kind == "HH":
-            if hi == max(d["High"].iloc[i-k:i+k+1]):
+            if hi >= winH - tol:
                 out.append({"price": hi, "tf": tf_label, "ts": now_ts, "kind": "HH", "strength": 1})
-        else:
-            if lo == min(d["Low"].iloc[i-k:i+k+1]):
+        else:  # LL
+            if lo <= winL + tol:
                 out.append({"price": lo, "tf": tf_label, "ts": now_ts, "kind": "LL", "strength": 1})
     return out
 
+# --- память уровней: обычные TF + «посев» из M1 если пусто ---
 def build_level_memory(symbol: str, df1m: pd.DataFrame):
     if df1m is None or df1m.empty:
         return
@@ -469,29 +481,29 @@ def build_level_memory(symbol: str, df1m: pd.DataFrame):
     # чистим по сроку
     mem = [L for L in mem if now_ts - L.get("ts", now_ts) <= LEVEL_EXPIRE_SEC]
 
-    # добавляем HH/LL с корректным вызовом (раньше LL без now_ts — ломало наполнение)
+    # добавляем HH/LL
     for tf, d, hours in (("5m", df5, LEVEL_MEMORY_HOURS["5m"]),
                          ("15m", df15, LEVEL_MEMORY_HOURS["15m"]),
                          ("60m", df60, LEVEL_MEMORY_HOURS["60m"])):
         mem += extract_levels(d, tf, hours, now_ts, "HH")
         mem += extract_levels(d, tf, hours, now_ts, "LL")
 
-    # если всё ещё мало уровней — СИДИРУЕМ из 1m (последние 400 баров)
+    # если всё ещё мало уровней — сеем из M1
     if len(mem) < 20 and (df1m is not None and not df1m.empty):
-        d = df1m.tail(400)
+        d = df1m.tail(LEVEL_SEED_BARS)
+        tol = 5e-4
         k = 3
         for i in range(k, len(d)-k):
             hi = float(d["High"].iloc[i]); lo = float(d["Low"].iloc[i])
-            if hi == max(d["High"].iloc[i-k:i+k+1]):
+            if hi >= float(d["High"].iloc[i-k:i+k+1].max()) - tol:
                 mem.append({"price": hi, "tf": "seed", "ts": now_ts, "kind": "HH", "strength": 1})
-            if lo == min(d["Low"].iloc[i-k:i+k+1]):
+            if lo <= float(d["Low"].iloc[i-k:i+k+1].min()) + tol:
                 mem.append({"price": lo, "tf": "seed", "ts": now_ts, "kind": "LL", "strength": 1})
 
     # дедуп и сохранение
     tol = LEVEL_DEDUP_TOL.get(symbol, 0.003)
     mem = _dedup_level_list(mem, tol)
     state["levels"][symbol] = mem
-
 
 def nearest_level_from_memory(symbol: str, side: str, price: float) -> float | None:
     mem = state["levels"].get(symbol, []) or []
@@ -742,7 +754,7 @@ def is_duplicate_signal(symbol: str, entry: float) -> bool:
 
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     global last_seen_idx, last_signal_idx, _last_signal_price
-    global scalp_cooldown_until, scalp_trades_hour_ct  # ← добавили здесь, до первого обращения
+    global scalp_cooldown_until, scalp_trades_hour_ct
 
     if symbol != "NG":
         return
@@ -875,6 +887,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-
-
-

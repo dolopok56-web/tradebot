@@ -88,7 +88,7 @@ SCALP_SL_ABS       = 0.0070         # 7 пипсов
 SCALP_MIN_IMPULSE  = 0.0040         # мин. диапазон свечи 1m (High-Low) — «толчок»
 SCALP_MIN_BODY     = 0.0020         # мин. тело свечи (abs(Close-Open))
 SCALP_NEAR_BREAK   = 0.0015         # близость к пробою экстремума толчковой свечи
-SCALP_COOLDOWN_SEC = 01             # кулдаун после сделки (скорость)
+SCALP_COOLDOWN_SEC = 1             # кулдаун после сделки (скорость)
 SCALP_MAX_PER_HOUR = 12             # ограничение частоты
 
 # ===================== STATE =====================
@@ -1038,5 +1038,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 

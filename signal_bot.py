@@ -317,7 +317,10 @@ def rnd(sym: str, x: float) -> float:
 def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    idx = pd.date_range(start=pd.Timestamp.utcnow().floor('D'), periods=len(df), freq="1min")
+    # строим ИСКУССТВЕННЫЙ равномерный минутный индекс, заканчивающийся текущей минутой,
+    # чтобы resample всегда работал стабильно
+    end = pd.Timestamp.utcnow().floor("min")
+    idx = pd.date_range(end - pd.Timedelta(minutes=len(df)-1), periods=len(df), freq="1min")
     z = df.copy()
     z.index = idx
     o = z["Open"].resample(f"{minutes}min").first()
@@ -327,6 +330,7 @@ def _resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     r = pd.concat([o,h,l,c], axis=1).dropna()
     r.columns = ["Open","High","Low","Close"]
     return r.reset_index(drop=True)
+
 
 def _swing_high(df, lookback=20):
     i = len(df) - 2
@@ -452,27 +456,28 @@ def extract_levels(df: pd.DataFrame, tf_label: str, lookback_hours: int, now_ts:
     return out
 
 def build_level_memory(symbol: str, df1m: pd.DataFrame):
-    if df1m is None or df1m.empty: return
+    if df1m is None or df1m.empty:
+        return
     now_ts = time.time()
 
+    # базовые TF
     df5   = _resample(df1m, 5)
     df15  = _resample(df1m, 15)
     df60  = _resample(df1m, 60)
 
-    mem = state["levels"].get(symbol, [])
+    mem = state["levels"].get(symbol, []) or []
+    # чистим по сроку
     mem = [L for L in mem if now_ts - L.get("ts", now_ts) <= LEVEL_EXPIRE_SEC]
 
+    # добавляем HH/LL с корректным вызовом (раньше LL без now_ts — ломало наполнение)
     for tf, d, hours in (("5m", df5, LEVEL_MEMORY_HOURS["5m"]),
                          ("15m", df15, LEVEL_MEMORY_HOURS["15m"]),
                          ("60m", df60, LEVEL_MEMORY_HOURS["60m"])):
-        mem += extract_levels(d, tf, hours, now_ts, "HH")   # ✔️
-        mem += extract_levels(d, tf, hours, now_ts, "LL")   # ✔️ была ошибка в наших прошлых версиях
+        mem += extract_levels(d, tf, hours, now_ts, "HH")
+        mem += extract_levels(d, tf, hours, now_ts, "LL")
 
-    tol = LEVEL_DEDUP_TOL.get(symbol, 0.003)
-    mem = _dedup_level_list(mem, tol)
-
-    # если после прохода всё ещё пусто — засеять быстрыми свинг-уровнями из последних 400 баров 1m
-    if not mem and df1m is not None and not df1m.empty:
+    # если всё ещё мало уровней — СИДИРУЕМ из 1m (последние 400 баров)
+    if len(mem) < 20 and (df1m is not None and not df1m.empty):
         d = df1m.tail(400)
         k = 3
         for i in range(k, len(d)-k):
@@ -481,9 +486,12 @@ def build_level_memory(symbol: str, df1m: pd.DataFrame):
                 mem.append({"price": hi, "tf": "seed", "ts": now_ts, "kind": "HH", "strength": 1})
             if lo == min(d["Low"].iloc[i-k:i+k+1]):
                 mem.append({"price": lo, "tf": "seed", "ts": now_ts, "kind": "LL", "strength": 1})
-        mem = _dedup_level_list(mem, tol)
 
+    # дедуп и сохранение
+    tol = LEVEL_DEDUP_TOL.get(symbol, 0.003)
+    mem = _dedup_level_list(mem, tol)
     state["levels"][symbol] = mem
+
 
 def nearest_level_from_memory(symbol: str, side: str, price: float) -> float | None:
     mem = state["levels"].get(symbol, []) or []
@@ -867,5 +875,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 

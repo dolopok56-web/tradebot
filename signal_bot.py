@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, json, csv, logging, asyncio, random
+import os, time, csv, logging, asyncio, random
 from datetime import datetime
-from copy import deepcopy
-
 import numpy as np
 import pandas as pd
 import aiohttp
@@ -15,7 +13,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V7.4 NG-30P Human-Pro (SMC/MTF, memory, 30-pip TP, structural SL, anti-dup, NG only by default, Yahoo feeds)"
+VERSION = "V7.5 NG-DYN Human (SMC/MTF, levels memory, DYNAMIC TP/SL, anti-dup, NG focus, Yahoo feeds)"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -25,17 +23,29 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
 SYMBOLS = {
-    "BTC": {"name": "BTC-USD",          "tf": "5m"},   # BTC manual
-    "NG":  {"name": "NATGAS (NG=F)",    "tf": "1m"},   # focus
+    "BTC": {"name": "BTC-USD",          "tf": "5m"},   # BTC вручную
+    "NG":  {"name": "NATGAS (NG=F)",    "tf": "1m"},   # фокус
     "XAU": {"name": "GOLD (XAUUSD=X)",  "tf": "1m"},
 }
 DXY_TICKERS = ("DX-Y.NYB", "DX=F")
 
-# Spread buffer (compensate broker spread/slippage)
+# Спред-буфер (подстраховка SL/TP)
 SPREAD_BUFFER = {"NG": 0.0040, "XAU": 0.20, "BTC": 5.0}
 
-# === 30-pip target for NG ===
-TP_MIN_ABS = {"NG": 0.0300, "XAU": 0.80, "BTC": 25.0}   # NG hard = 30 pips
+# === Динамические цели для NG (в пипсах) ===
+# Бот стремится к ~30 пипсам, но подстраивается под волу:
+NG_TP_AIM      = 0.0300   # желаемая цель, если вола ок
+NG_TP_MIN      = 0.0150   # минимум (когда рынок тихий — чтобы не молчать)
+NG_TP_MAX      = 0.0600   # максимум (когда летит — не жадничаем)
+NG_TP_ATR_K    = 1.25     # множитель к ATR(M1) для базовой цели (динамика)
+NG_TP_WEIGHT   = 0.6      # насколько учитываем ATR против фикс-цели (0..1)
+
+# SL динамика (структурный + ATR):
+NG_SL_MIN      = 0.0100   # минимум стопа, чтобы не выбивало шумом
+NG_SL_ATR_K    = 0.30     # доб. «подушку» к структурному свингу
+NG_SL_MAX      = 0.0250   # максимум по ширине стопа
+
+# Confidence
 CONF_MIN_TRADE = {"NG": 0.50, "XAU": 0.55, "BTC": 0.55}
 CONF_MIN_IDEA  = 0.05
 
@@ -43,11 +53,11 @@ SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
 MAX_IDEAS_PER_HOUR = 60
 
-# Sessions bonus windows (UTC-based check)
+# Сессии (UTC-часы)
 LONDON_HOURS = range(7, 15)
 NY_HOURS     = range(12, 21)
 
-# Speeds & intervals
+# Частоты
 POLL_SEC        = 0.3
 ALIVE_EVERY_SEC = 300
 BOOT_COOLDOWN_S = 12
@@ -73,19 +83,13 @@ MAX_TRADES_PER_DAY = {"NG": 5, "XAU": 3, "BTC": 0}
 _trades_today_key = ""
 _trades_today = {"NG": 0, "XAU": 0, "BTC": 0}
 
-# ====== NG 30-pip entry (pullback → micro-break) ======
-NG_M1_ATR_MIN   = 0.0050      # need some vol to attempt 30 pips
-NG_M1_TP_ABS    = 0.0300      # hard 30 pips target
-NG_M1_SL_MIN    = 0.0120      # never tighter than 12 pips
-NG_M1_SL_ATR_K  = 0.35        # SL padding by ATR(M1)
-NG_M1_SL_MAX    = 0.0220      # cap SL so RR stays ok
-NG_M1_EMA_FAST  = 20
-NG_M1_EMA_SLOW  = 50
-NG_IMPULSE_MIN  = 0.0060      # last impulse (H-L) in recent bars to confirm life
-NG_RECENT_BARS  = 8           # lookback to find an impulse bar
-
-# ====== SCALP MODE (disabled) ======
-SCALP_MODE_ENABLED = False
+# ====== Триггеры для NG (не «скальп по секундам») ======
+# Смещение с M5 EMA20/EMA50; вход на M1:
+NG_EMA_FAST  = 20
+NG_EMA_SLOW  = 50
+NG_ATR1_MIN  = 0.0035   # совсем тихий рынок — не лезем
+NG_IMPULSE_MIN = 0.0055 # в последние 10 баров M1 должен быть импульс
+NG_IMPULSE_LOOKBACK = 10
 
 # ===================== STATE =====================
 boot_ts = time.time()
@@ -107,10 +111,10 @@ state = {
     "levels": {"NG": [], "XAU": [], "BTC": []},
     "atr_NG": 0.0, "atr_XAU": 0.0, "atr_BTC": 0.0
 }
-mode = "NG"           # default focus on NATGAS
+mode = "NG"           # по умолчанию фокус на NATGAS
 requested_mode = "NG"
 
-# Level memory params
+# Память уровней
 LEVEL_MEMORY_HOURS = {"5m": 72, "15m": 72, "60m": 120}
 LEVEL_DEDUP_TOL    = {"NG": 0.003, "XAU": 0.30, "BTC": 8.0}
 LEVEL_EXPIRE_SEC   = 48 * 3600
@@ -543,57 +547,77 @@ def format_signal(setup, buffer):
         f"RR≈{round(rr,2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
-# ===================== NG-30P ENTRY BUILDER =====================
+# ===================== NG DYNAMIC ENTRY BUILDER =====================
 def _atr_m1(df1m: pd.DataFrame, period: int = 14) -> float:
     return _atr_m(df1m, period)
 
 def _has_recent_impulse(df1m: pd.DataFrame) -> bool:
     n = len(df1m)
-    lo = max(2, n - NG_RECENT_BARS - 1)
+    lo = max(2, n - NG_IMPULSE_LOOKBACK - 1)
     window = df1m.iloc[lo:n-1]
     if window.empty: return False
     rng = (window["High"] - window["Low"]).max()
     return float(rng) >= NG_IMPULSE_MIN
 
-def build_entry_ng_30pip(df1m: pd.DataFrame) -> dict | None:
+def _choose_dynamic_tp(atr1: float) -> float:
+    # Взвешиваем «хотим 30 пипсов» и реальную волу через ATR
+    aim = NG_TP_AIM
+    atr_target = NG_TP_ATR_K * atr1
+    blended = NG_TP_WEIGHT * atr_target + (1.0 - NG_TP_WEIGHT) * aim
+    return max(NG_TP_MIN, min(NG_TP_MAX, blended))
+
+def _struct_sl(entry: float, swing: float, side: str, atr1: float, buf: float) -> float:
+    pad = max(NG_SL_MIN, NG_SL_ATR_K * atr1)
+    if side == "BUY":
+        sl = (swing - pad - buf)
+        sl = min(entry - 1e-6, sl)
+        if entry - sl > NG_SL_MAX: sl = entry - NG_SL_MAX
+        return sl
+    else:
+        sl = (swing + pad + buf)
+        sl = max(entry + 1e-6, sl)
+        if sl - entry > NG_SL_MAX: sl = entry + NG_SL_MAX
+        return sl
+
+def build_entry_ng_dynamic(df1m: pd.DataFrame) -> dict | None:
     """
-    Bias M5: EMA20 > EMA50 (BUY) / EMA20 < EMA50 (SELL).
-    Trigger M1: pullback into EMA20–EMA50 zone and close breaks prev high/low.
-    TP: fixed 0.0300 (+spread); SL: swing ± max(NG_M1_SL_MIN, NG_M1_SL_ATR_K*ATR1) (clamped to NG_M1_SL_MAX).
+    Bias M5: EMA20/EMA50; Trigger M1: pullback в EMA-зону + закрытие M1 пробивает prev high/low.
+    TP выбирается динамически из ATR и «желания» ~30 пипсов.
+    SL = свинг ± (ATR-подушка), с ограничением.
     """
     if df1m is None or df1m.empty or len(df1m) < 180:
         return None
 
-    # Bias on M5
+    # Bias M5
     df5 = _resample(df1m, 5)
-    if df5.empty or len(df5) < NG_M1_EMA_SLOW*2:
+    if df5.empty or len(df5) < NG_EMA_SLOW*2:
         return None
     c5 = df5["Close"].values
-    ema20_5 = _ema_series(list(c5), NG_M1_EMA_FAST)[-1]
-    ema50_5 = _ema_series(list(c5), NG_M1_EMA_SLOW)[-1]
+    ema20_5 = _ema_series(list(c5), NG_EMA_FAST)[-1]
+    ema50_5 = _ema_series(list(c5), NG_EMA_SLOW)[-1]
     if ema20_5 is None or ema50_5 is None:
         return None
     bias = "UP" if ema20_5 > ema50_5 else ("DOWN" if ema20_5 < ema50_5 else "NONE")
     if bias == "NONE":
         return None
 
-    # M1 trigger
-    closes = df1m["Close"].values
-    highs  = df1m["High"].values
-    lows   = df1m["Low"].values
-    ema20_1 = _ema_series(list(closes), NG_M1_EMA_FAST)
-    ema50_1 = _ema_series(list(closes), NG_M1_EMA_SLOW)
-    if len(ema20_1) < 2 or len(ema50_1) < 2:
-        return None
-
-    # Require some vol and recent impulse
+    # ATR/Impulse guard
     atr1 = _atr_m1(df1m, 14)
-    if atr1 < NG_M1_ATR_MIN:
+    if atr1 < NG_ATR1_MIN:
         return None
     if not _has_recent_impulse(df1m):
         return None
 
-    i = len(closes) - 1  # last closed
+    # M1 trigger
+    closes = df1m["Close"].values
+    highs  = df1m["High"].values
+    lows   = df1m["Low"].values
+    ema20_1 = _ema_series(list(closes), NG_EMA_FAST)
+    ema50_1 = _ema_series(list(closes), NG_EMA_SLOW)
+    if len(ema20_1) < 2 or len(ema50_1) < 2:
+        return None
+
+    i = len(closes) - 1  # последняя закрытая
     prev_h = float(highs[i-1]); prev_l = float(lows[i-1])
     c_now  = float(closes[i]);  c_prev = float(closes[i-1])
     e20 = float(ema20_1[i]); e50 = float(ema50_1[i])
@@ -603,30 +627,28 @@ def build_entry_ng_30pip(df1m: pd.DataFrame) -> dict | None:
         return None
 
     buf = SPREAD_BUFFER["NG"]
-    side = None; entry=None; sl=None; tp=None
+    side=None; entry=None; sl=None; tp=None
+    tp_abs = _choose_dynamic_tp(atr1)
 
     if bias == "UP" and c_now > prev_h:
         side = "BUY"; entry = c_now
         swing = float(min(lows[i], lows[i-1]))
-        pad = max(NG_M1_SL_MIN, NG_M1_SL_ATR_K * atr1)
-        sl  = swing - pad - buf
-        sl  = min(entry - 1e-6, sl)
-        # clamp SL width
-        if (entry - sl) > NG_M1_SL_MAX: sl = entry - NG_M1_SL_MAX
-        tp  = entry + NG_M1_TP_ABS + buf
+        sl = _struct_sl(entry, swing, side, atr1, buf)
+        tp = entry + tp_abs + buf
     elif bias == "DOWN" and c_now < prev_l:
         side = "SELL"; entry = c_now
         swing = float(max(highs[i], highs[i-1]))
-        pad = max(NG_M1_SL_MIN, NG_M1_SL_ATR_K * atr1)
-        sl  = swing + pad + buf
-        sl  = max(entry + 1e-6, sl)
-        if (sl - entry) > NG_M1_SL_MAX: sl = entry + NG_M1_SL_MAX
-        tp  = entry - NG_M1_TP_ABS - buf
+        sl = _struct_sl(entry, swing, side, atr1, buf)
+        tp = entry - tp_abs - buf
     else:
         return None
 
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-    conf = 0.6  # fixed confidence for NG-30P trigger
+
+    # Confidence: базово 0.55–0.65; сессия добавляет
+    conf = 0.55
+    if _in_session_utc(): conf += 0.05
+    conf = max(0.0, min(0.95, conf))
 
     return {
         "symbol": "NG",
@@ -639,10 +661,10 @@ def build_entry_ng_30pip(df1m: pd.DataFrame) -> dict | None:
         "rr": rr,
         "conf": conf,
         "tp_abs": abs(tp - entry),
-        "tp_min": TP_MIN_ABS["NG"]
+        "tp_min": NG_TP_MIN
     }
 
-# ===================== GENERIC SETUP (fallback for XAU/BTC/AUTO) =====================
+# ===================== Generic fallback (XAU/BTC/AUTO) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
     if df1m is None or df1m.empty or len(df1m) < 240:
         return None
@@ -663,11 +685,10 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
         hh1 = _swing_high(df60, 20); ll1=_swing_low(df60,20)
         bias = "UP" if c1 > hh1 else ("DOWN" if c1 < ll1 else "UP")
 
-    fvg_ok, fvg_dir, fvg_top, fvg_bot, fvg_w = fvg_last_soft(df15, lookback=24, use_bodies=True)
+    fvg_ok, _, _, _, _ = fvg_last_soft(df15, lookback=24, use_bodies=True)
     choch_up   = choch_soft(df5, "UP",   8, False)
     choch_down = choch_soft(df5, "DOWN", 8, False)
     sweep15, sweep_dir15 = had_liquidity_sweep(df15, lookback=20)
-    cons_break = is_consolidation_break(df5)
 
     side = "BUY" if bias=="UP" else "SELL"
     if sweep15:
@@ -685,72 +706,29 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | 
         sl = max(entry, hi15 + buf)
 
     mem_target = nearest_level_from_memory(symbol, side, entry)
-    if mem_target is None:
-        def nearest_level_above(df: pd.DataFrame, price: float, lookback_bars: int) -> float | None:
-            highs = df["High"].tail(lookback_bars)
-            c = highs[highs > price]
-            return float(c.min()) if not c.empty else None
-        def nearest_level_below(df: pd.DataFrame, price: float, lookback_bars: int) -> float | None:
-            lows = df["Low"].tail(lookback_bars)
-            c = lows[lows < price]
-            return float(c.max()) if not c.empty else None
-
-        lb5  = _bars_for_hours("5m", 72)
-        lb15 = _bars_for_hours("15m", 72)
-
-        if side == "BUY":
-            lvl5  = nearest_level_above(df5,  entry,  lb5)
-            lvl15 = nearest_level_above(df15, entry,  lb15)
-            if lvl5 is not None and lvl15 is not None:
-                mem_target = min(lvl5, lvl15)
-            else:
-                mem_target = lvl5 if lvl5 is not None else lvl15
-        else:
-            lvl5  = nearest_level_below(df5,  entry,  lb5)
-            lvl15 = nearest_level_below(df15, entry,  lb15)
-            if lvl5 is not None and lvl15 is not None:
-                mem_target = max(lvl5, lvl15)
-            else:
-                mem_target = lvl5 if lvl5 is not None else lvl15
 
     if side == "BUY":
         if mem_target is None or mem_target <= entry:
-            target = max(entry + max(entry - sl, 1e-9)*0.8, entry + TP_MIN_ABS.get(symbol,0.0))
+            target = entry + max(abs(entry - sl)*0.8, SPREAD_BUFFER.get(symbol,0))
         else:
             target = mem_target
         tp = target + buf
     else:
         if mem_target is None or mem_target >= entry:
-            target = min(entry - max(sl - entry, 1e-9)*0.8, entry - TP_MIN_ABS.get(symbol,0.0))
+            target = entry - max(abs(entry - sl)*0.8, SPREAD_BUFFER.get(symbol,0))
         else:
             target = mem_target
         tp = target - buf
 
     tp_abs = abs(tp - entry)
-    tp_min = TP_MIN_ABS.get(symbol, 0.0)
-    if tp_abs < tp_min:
-        return None
-
+    tp_min = SPREAD_BUFFER.get(symbol, 0.0) + 1e-4
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
 
     score = 0
-    if fvg_ok or cons_break: score += 20
-    if sweep15:              score += 20
+    if fvg_ok: score += 20
     if (side=="BUY" and choch_up) or (side=="SELL" and choch_down): score += 15
-    if inside_higher_ob(df5, df60) or inside_higher_ob(df5, df240): score += 10
     if _in_session_utc(): score += 5
-    if rr <= 1.0: score += 10
-
-    mem = state["levels"].get(symbol, [])
-    if mem:
-        near = [L for L in mem if abs(L["price"] - tp) <= (3*LEVEL_DEDUP_TOL.get(symbol,0.003))]
-        score += min(15, 3 * len(near))
-
-    if symbol == "XAU":
-        dxy_bias = dxy_bias_from_df(dxy_bias) if isinstance(dxy_bias, pd.DataFrame) else dxy_bias
-
-    score = max(0, min(100, score))
-    conf  = score / 100.0
+    score = max(0, min(100, score)); conf = score/100.0
     if conf < CONF_MIN_IDEA:
         return None
 
@@ -842,7 +820,7 @@ def is_duplicate_signal(symbol: str, entry: float) -> bool:
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.DataFrame | None):
     global last_seen_idx, last_signal_idx, _last_signal_price
 
-    # which symbols are we running
+    # routing
     if mode != "AUTO" and symbol not in (mode,):
         return
 
@@ -878,10 +856,10 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
     if time.time() - boot_ts < BOOT_COOLDOWN_S: return
     if time.time() < cooldown_until[symbol]:   return
 
-    # build setup:
+    # Build setup: NG dynamic first
     setup = None
     if symbol == "NG" and _allow_new_trade_today("NG"):
-        setup = build_entry_ng_30pip(df)
+        setup = build_entry_ng_dynamic(df)
     if setup is None:
         dxy_bias = dxy_df if (symbol=="XAU") else None
         setup = build_setup(df, symbol, SYMBOLS[symbol]["tf"], dxy_bias=dxy_bias)
@@ -904,7 +882,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
     if not _allow_new_trade_today(symbol):
         return
 
-    # optional idea ping
+    # optional idea
     if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
         await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
         _last_idea_ts[symbol] = time.time()
@@ -912,7 +890,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
         if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
             _ideas_count_hour_ts[symbol] = time.time()
 
-    # entry
+    # Enter
     if conf >= conf_thr and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
         trade[symbol] = {

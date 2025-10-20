@@ -130,6 +130,19 @@ async def send_log(text: str):
 def mode_title(m: str) -> str:
     return "NATGAS (NG=F)"
 
+async def warmup_levels_loop():
+    """Периодически подкачиваем df и насильно строим память уровней,
+    чтобы умный не оставался слепым."""
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                df = await get_df(session, "NG")
+                if not df.empty:
+                    build_level_memory("NG", df)
+            except Exception as e:
+                logging.error(f"warmup error: {e}")
+            await asyncio.sleep(60)  # раз в минуту
+
 async def _request_mode(new_mode: str, m: Message | None = None):
     global requested_mode, mode
     requested_mode = new_mode
@@ -181,8 +194,19 @@ async def cmd_stop(m: Message):
     await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
 
 @router.message(F.text.lower() == "статус")
+
 async def cmd_status(m: Message):
     now = time.time()
+
+    # форс-обновим память прямо при запросе статуса (разово, быстро)
+    try:
+        async with aiohttp.ClientSession() as s:
+            df = await get_df(s, "NG")
+            if not df.empty:
+                build_level_memory("NG", df)
+    except Exception as e:
+        logging.error(f"status warm build err: {e}")
+
     lines = [f"mode: NG (requested: {requested_mode})",
              f"alive: OK | poll={POLL_SEC}s"]
     s = "NG"
@@ -201,6 +225,7 @@ async def cmd_status(m: Message):
     scd = max(0, int(scalp_cooldown_until - now))
     lines.append(f"Assist stats: cooldown={scd}s  per_hour={scalp_trades_hour_ct}")
     await m.answer("```\n"+ "\n".join(lines) + "\n```")
+
 
 @router.message(F.text.lower() == "отчет")
 async def cmd_report(m: Message):
@@ -880,10 +905,13 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     asyncio.create_task(engine_loop())
     asyncio.create_task(alive_loop())
+    asyncio.create_task(warmup_levels_loop())  # ← добавили
     await dp.start_polling(bot_main)
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

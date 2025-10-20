@@ -717,7 +717,10 @@ def is_duplicate_signal(symbol: str, entry: float) -> bool:
 
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     global last_seen_idx, last_signal_idx, _last_signal_price
-    if symbol != "NG": return
+    global scalp_cooldown_until, scalp_trades_hour_ct  # ← добавили здесь, до первого обращения
+
+    if symbol != "NG":
+        return
 
     df = await get_df(session, symbol)
     if df.empty or len(df) < 240:
@@ -741,15 +744,19 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
             if hit_tp:
                 price_now = float(post["Close"].iloc[-1])
                 asyncio.create_task(notify_outcome(symbol, "TP", price_now))
-                finish_trade(symbol, "TP", price_now); return
+                finish_trade(symbol, "TP", price_now)
+                return
             if hit_sl:
                 price_now = float(post["Close"].iloc[-1])
                 asyncio.create_task(notify_outcome(symbol, "SL", price_now))
-                finish_trade(symbol, "SL", price_now); return
+                finish_trade(symbol, "SL", price_now)
+                return
         return
 
-    if time.time() - boot_ts < BOOT_COOLDOWN_S: return
-    if time.time() < cooldown_until[symbol]:   return
+    if time.time() - boot_ts < BOOT_COOLDOWN_S:
+        return
+    if time.time() < cooldown_until[symbol]:
+        return
 
     # 1) Пытаемся «умный»
     setup = build_setup(df, "NG", SYMBOLS["NG"]["tf"], dxy_bias=None)
@@ -764,23 +771,22 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     if last_signal_idx[symbol] == closed_idx:
         return
 
-    buffer    = dynamic_buffer(symbol)
+    buffer    = SPREAD_BUFFER.get(symbol, 0.0)
     conf_thr  = CONF_MIN_TRADE.get(symbol, 0.55)
     conf      = float(setup["conf"])
     close_now = float(df["Close"].iloc[-1])
     entry     = float(setup["entry"])
 
-    if not is_fresh_enough(symbol, entry, close_now):
+    if abs(entry - close_now) > 15.0 * buffer:
         return
-    if is_duplicate_signal(symbol, entry):
+    if _last_signal_price[symbol] is not None and abs(entry - _last_signal_price[symbol]) <= 8.0 * buffer:
         return
 
-    if conf >= CONF_MIN_IDEA and can_send_idea(symbol):
-        await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
-        _last_idea_ts[symbol] = time.time()
-        _ideas_count_hour[symbol] = _ideas_count_hour.get(symbol, 0) + 1
-        if _ideas_count_hour_ts.get(symbol, 0.0) == 0.0:
-            _ideas_count_hour_ts[symbol] = time.time()
+    if conf >= CONF_MIN_IDEA and SEND_IDEAS:
+        now = time.time()
+        if (IDEA_COOLDOWN_SEC == 0 or now - _last_idea_ts[symbol] >= IDEA_COOLDOWN_SEC):
+            await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
+            _last_idea_ts[symbol] = now
 
     if conf >= conf_thr and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
@@ -794,8 +800,8 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         }
         last_signal_idx[symbol] = closed_idx
         _last_signal_price[symbol] = entry
+
         # ассист частотный кулдаун
-        global scalp_trades_hour_ct, scalp_cooldown_until
         scalp_trades_hour_ct += 1
         scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
         return
@@ -844,3 +850,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

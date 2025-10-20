@@ -565,6 +565,16 @@ def format_signal(setup, buffer):
         f"RR≈{round(rr,2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
+def _end_position(symbol: str, outcome: str, post):
+    price_now = float(post["Close"].iloc[-1])
+    asyncio.create_task(notify_outcome(symbol, outcome, price_now))
+    finish_trade(symbol, outcome, price_now)
+
+    # сброс состояния, чтобы не нужен был ручной /reset
+    trade[symbol] = None
+    _last_signal_price[symbol] = None
+    cooldown_until[symbol] = time.time() + 0  # без доп. кулдауна (или поставь свой)
+
 # ===================== BUILD SETUP (MEMORY-LEVEL TP/SL) =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias: str | None = None):
     if df1m is None or df1m.empty or len(df1m) < 240:
@@ -838,7 +848,7 @@ def can_send_idea(sym: str) -> bool:
 
 def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
     buf = SPREAD_BUFFER.get(symbol, 0.0)
-    lim = 15.0 * buf
+    lim = 2.0 * buf
     return abs(float(entry) - float(close_now)) <= lim
 
 def is_duplicate_signal(symbol: str, entry: float) -> bool:
@@ -859,9 +869,9 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
 
     cur_idx = len(df) - 1
     closed_idx = cur_idx - 1
-    if closed_idx <= last_seen_idx[symbol]:
+    if cur_idx <= last_seen_idx[symbol]:
         return
-    last_seen_idx[symbol] = closed_idx
+    last_seen_idx[symbol] = cur_idx
 
     sess = trade[symbol]
     if sess:
@@ -872,13 +882,13 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str, dxy_df: pd.
             hit_tp = (post["High"].max() >= tp) if side=="BUY" else (post["Low"].min() <= tp)
             hit_sl = (post["Low"].min()  <= sl) if side=="BUY" else (post["High"].max() >= sl)
             if hit_tp:
-                price_now = float(post["Close"].iloc[-1])
-                asyncio.create_task(notify_outcome(symbol, "TP", price_now))
-                finish_trade(symbol, "TP", price_now); return
+                _end_position(symbol, "TP", post)
+                return
+
             if hit_sl:
-                price_now = float(post["Close"].iloc[-1])
-                asyncio.create_task(notify_outcome(symbol, "SL", price_now))
-                finish_trade(symbol, "SL", price_now); return
+                _end_position(symbol, "SL", post)
+                return
+
         return
 
     if time.time() - boot_ts < BOOT_COOLDOWN_S: return
@@ -943,16 +953,11 @@ async def handle_scalp_ng(session: aiohttp.ClientSession):
             hit_tp = (post["High"].max() >= tp) if side=="BUY" else (post["Low"].min() <= tp)
             hit_sl = (post["Low"].min()  <= sl) if side=="BUY" else (post["High"].max() >= sl)
             if hit_tp:
-                price_now = float(post["Close"].iloc[-1])
-                asyncio.create_task(notify_outcome("NG", "TP", price_now))
-                finish_trade("NG", "TP", price_now)
-                scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
+                _end_position(symbol, "TP", post)
                 return
+
             if hit_sl:
-                price_now = float(post["Close"].iloc[-1])
-                asyncio.create_task(notify_outcome("NG", "SL", price_now))
-                finish_trade("NG", "SL", price_now)
-                scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
+                _end_position(symbol, "SL", post)
                 return
         return
 
@@ -1001,7 +1006,7 @@ async def engine_loop():
                 await asyncio.sleep(POLL_SEC)
             except Exception as e:
                 logging.error(f"engine error: {e}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.2)
 
 # ===================== ALIVE LOOP =====================
 def _atr_m15(df: pd.DataFrame) -> float:
@@ -1054,3 +1059,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

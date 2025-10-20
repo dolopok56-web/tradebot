@@ -23,6 +23,9 @@ LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "8073073724:AAHGuUPg9s_oRsH24CpLUu-
 OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
+TWELVE_KEY = os.getenv("TWELVE_KEY", "970c6f5c89b64abcb2f1a32c2601e592")
+TWELVE_BASE = "https://api.twelvedata.com/time_series"
+
 # ===================== MARKETS / SETTINGS =====================
 # tf в подписи сигнала; сами данные берём 1m и ресемплим
 SYMBOLS = {
@@ -56,7 +59,7 @@ LONDON_HOURS = range(7, 15)
 NY_HOURS     = range(12, 21)
 
 # Скорость и интервалы
-POLL_SEC        = 1
+POLL_SEC        = 0.2
 ALIVE_EVERY_SEC = 300
 BOOT_COOLDOWN_S = 15
 COOLDOWN_SEC    = 0    # без паузы после SL в обычных режимах
@@ -308,23 +311,26 @@ async def _get_df_stooq_1m(session, stooq_code: str) -> pd.DataFrame:
 async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     now_ts = time.time()
     c = _prices_cache.get(symbol)
-    cache_ttl = 1.0
+    cache_ttl = 0.3  # более частое обновление
     if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
 
+    # --- Twelve Data NG ---
     if symbol == "NG":
-        for t in ("NG%3DF",):
-            df = _df_from_yahoo_v8(await _yahoo_json(session, f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"))
-            if not df.empty:
-                last_candle_close_ts["NG"] = time.time()
-                _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
-                return df
-        df = await _get_df_stooq_1m(session, "ng.f")
-        if not df.empty:
-            last_candle_close_ts["NG"] = time.time()
-            _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"stooq"}
-            return df
-        return pd.DataFrame()
+        url = f"{TWELVE_BASE}?symbol=NG=F&interval=1min&apikey={TWELVE_KEY}&outputsize=300"
+        try:
+            async with session.get(url, timeout=HTTP_TIMEOUT) as r:
+                data = await r.json()
+                if "values" in data:
+                    df = pd.DataFrame(data["values"])
+                    df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"})
+                    df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
+                    df = df.iloc[::-1].reset_index(drop=True)  # реверс
+                    last_candle_close_ts["NG"] = time.time()
+                    _prices_cache["NG"] = {"ts": now_ts, "df": df, "feed":"twelve"}
+                    return df
+        except:
+            return pd.DataFrame()
 
     if symbol == "XAU":
         for t in ("XAUUSD%3DX", "GC%3DF"):
@@ -701,7 +707,7 @@ def build_scalp_setup_ng(df1m: pd.DataFrame) -> dict | None:
     if df1m is None or df1m.empty or len(df1m) < 30:
         return None
 
-    i = len(df1m) - 2  # последняя закрытая
+    i = len(df1m) - 1  # последняя закрытая
     H = float(df1m["High"].iloc[i])
     L = float(df1m["Low"].iloc[i])
     O = float(df1m["Open"].iloc[i])
@@ -912,8 +918,10 @@ async def handle_scalp_ng(session: aiohttp.ClientSession):
 
     if trade["NG"]:
         sess = trade["NG"]
+        # читаем все бары, включая текущий
         start_i = int(sess.get("entry_bar_idx", len(df)-1))
-        post = df.iloc[(start_i + 1):]
+        post = df.iloc[start_i:]
+
         if not post.empty:
             side = sess["side"]; tp = sess["tp"]; sl = sess["sl"]
             hit_tp = (post["High"].max() >= tp) if side=="BUY" else (post["Low"].min() <= tp)
@@ -1030,4 +1038,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

@@ -82,10 +82,10 @@ SCALP_SYMBOL       = "NG"
 SCALP_TF_LABEL     = "1m"           # подпись в сигнале
 SCALP_TP_ABS       = 0.0100         # 10 пипсов
 SCALP_SL_ABS       = 0.0070         # 7 пипсов
-SCALP_MIN_IMPULSE  = 0.0060         # мин. диапазон свечи 1m (High-Low) — «толчок»
-SCALP_MIN_BODY     = 0.0040         # мин. тело свечи (abs(Close-Open))
+SCALP_MIN_IMPULSE  = 0.0040         # мин. диапазон свечи 1m (High-Low) — «толчок»
+SCALP_MIN_BODY     = 0.0020         # мин. тело свечи (abs(Close-Open))
 SCALP_NEAR_BREAK   = 0.0015         # близость к пробою экстремума толчковой свечи
-SCALP_COOLDOWN_SEC = 60             # кулдаун после сделки (скорость)
+SCALP_COOLDOWN_SEC = 01             # кулдаун после сделки (скорость)
 SCALP_MAX_PER_HOUR = 12             # ограничение частоты
 
 # ===================== STATE =====================
@@ -1030,3 +1030,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

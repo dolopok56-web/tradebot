@@ -454,18 +454,35 @@ def extract_levels(df: pd.DataFrame, tf_label: str, lookback_hours: int, now_ts:
 def build_level_memory(symbol: str, df1m: pd.DataFrame):
     if df1m is None or df1m.empty: return
     now_ts = time.time()
+
     df5   = _resample(df1m, 5)
     df15  = _resample(df1m, 15)
     df60  = _resample(df1m, 60)
+
     mem = state["levels"].get(symbol, [])
     mem = [L for L in mem if now_ts - L.get("ts", now_ts) <= LEVEL_EXPIRE_SEC]
+
     for tf, d, hours in (("5m", df5, LEVEL_MEMORY_HOURS["5m"]),
                          ("15m", df15, LEVEL_MEMORY_HOURS["15m"]),
                          ("60m", df60, LEVEL_MEMORY_HOURS["60m"])):
-        mem += extract_levels(d, tf, hours, now_ts, "HH")
-        mem += extract_levels(d, tf, hours, "LL")
+        mem += extract_levels(d, tf, hours, now_ts, "HH")   # ✔️
+        mem += extract_levels(d, tf, hours, now_ts, "LL")   # ✔️ была ошибка в наших прошлых версиях
+
     tol = LEVEL_DEDUP_TOL.get(symbol, 0.003)
     mem = _dedup_level_list(mem, tol)
+
+    # если после прохода всё ещё пусто — засеять быстрыми свинг-уровнями из последних 400 баров 1m
+    if not mem and df1m is not None and not df1m.empty:
+        d = df1m.tail(400)
+        k = 3
+        for i in range(k, len(d)-k):
+            hi = float(d["High"].iloc[i]); lo = float(d["Low"].iloc[i])
+            if hi == max(d["High"].iloc[i-k:i+k+1]):
+                mem.append({"price": hi, "tf": "seed", "ts": now_ts, "kind": "HH", "strength": 1})
+            if lo == min(d["Low"].iloc[i-k:i+k+1]):
+                mem.append({"price": lo, "tf": "seed", "ts": now_ts, "kind": "LL", "strength": 1})
+        mem = _dedup_level_list(mem, tol)
+
     state["levels"][symbol] = mem
 
 def nearest_level_from_memory(symbol: str, side: str, price: float) -> float | None:
@@ -850,4 +867,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

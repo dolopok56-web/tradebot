@@ -12,7 +12,7 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ===================== VERSION =====================
-VERSION = "V7.8 NG Human + Assist (NG-only, level memory fixed+seed, Yahoo 1m, ATR1>=0.004, TP 0.020 / SL 0.012)"
+VERSION = "V7.9 NG Human+Assist — trend+breakout (1–2/day), memory seed, Yahoo 1m, no daily cap, partial-TP anti-greed"
 
 # ===================== TOKENS / OWNER =====================
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
@@ -29,8 +29,8 @@ SPREAD_BUFFER = {"NG": 0.0040}
 # Минимальная реальная дистанция TP для «умного»
 TP_MIN_ABS = {"NG": 0.0150}
 
-# Порог уверенности
-CONF_MIN_TRADE = {"NG": 0.50}
+# Порог уверенности (слегка ослаблен, чтобы не молчал)
+CONF_MIN_TRADE = {"NG": 0.45}  # было 0.50
 CONF_MIN_IDEA  = 0.05
 
 # Идеи
@@ -73,6 +73,24 @@ SCALP_TP_ABS       = 0.0200   # 20 пипсов
 SCALP_SL_ABS       = 0.0120   # 12 пипсов
 SCALP_COOLDOWN_SEC = 1        # небольшой локальный кулдаун после открытия
 SCALP_MAX_PER_HOUR = 20       # анти-спам в активные минуты
+
+# ====== HUMAN: активатор по тренду и брейкаутам ======
+# тренд за N минут и минимальный направленный ход
+TREND_LOOKBACK_MIN = 10        # сравниваем с ценой 10 минут назад
+TREND_MIN_MOVE     = 0.0105    # 10–11 пипсов направленного хода — можно подогнать 0.0100..0.0120
+ATR1_MIN_FOR_TREND = 0.0040    # минимальная мгновенная вола (1m ATR)
+
+# брейкауты и работа с уровнями памяти
+BREAK_NEAR         = 0.0030    # «близко к пробою» swing high/low (3 пипса)
+LEVEL_PROX         = 0.0060    # «рядом с уровнем памяти» (6 пипсов)
+MOMENTUM_MIN_BODY  = 0.0008    # минимальное тело бара для импульса
+MOMENTUM_MIN_RANGE = 0.0016    # минимальный диапазон H-L для импульса
+
+# Анти-жадность (опционально — можно выключить PARTIAL_ENABLE=False)
+PARTIAL_ENABLE   = True
+TP1_PARTIAL      = 0.0100   # первая фиксация +10 пипсов
+PARTIAL_KEEP     = 0.50     # закрыть 50% вручную на TP1 (бот уведомит)
+MOVE_SL_TO_BE    = True     # после TP1 переносим SL в BE (entry +/- buffer)
 
 # ===================== STATE =====================
 boot_ts = time.time()
@@ -194,7 +212,6 @@ async def cmd_stop(m: Message):
     await m.answer("🛑 Остановил. Открытых нет, короткий кулдаун.")
 
 @router.message(F.text.lower() == "статус")
-
 async def cmd_status(m: Message):
     now = time.time()
 
@@ -225,7 +242,6 @@ async def cmd_status(m: Message):
     scd = max(0, int(scalp_cooldown_until - now))
     lines.append(f"Assist stats: cooldown={scd}s  per_hour={scalp_trades_hour_ct}")
     await m.answer("```\n"+ "\n".join(lines) + "\n```")
-
 
 @router.message(F.text.lower() == "отчет")
 async def cmd_report(m: Message):
@@ -465,7 +481,7 @@ def _dedup_level_list(levels: list, tol: float) -> list:
             out.append(L)
     return out
 
-# --- ключевая правка: уровни с допуском по float ---
+# --- уровни с допуском по float ---
 def extract_levels(df: pd.DataFrame, tf_label: str, lookback_hours: int, now_ts: float, kind: str) -> list:
     if df is None or df.empty:
         return []
@@ -555,77 +571,6 @@ def format_signal(setup, buffer):
     )
 
 # ===================== HUMAN (умный NG) =====================
-def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias=None):
-    if df1m is None or df1m.empty or len(df1m) < 240:
-        return None
-
-    build_level_memory(symbol, df1m)
-
-    df5   = _resample(df1m, 5)
-    df15  = _resample(df1m, 15)
-    df60  = _resample(df1m, 60)
-    df240 = _resample(df1m, 240)
-    if df5.empty or df15.empty or df60.empty or df240.empty: return None
-
-    c1 = float(df60["Close"].iloc[-2])
-    hh4 = _swing_high(df240, 20); ll4=_swing_low(df240,20)
-    if   c1 > hh4:  bias = "UP"
-    elif c1 < ll4:  bias = "DOWN"
-    else:
-        hh1 = _swing_high(df60, 20); ll1=_swing_low(df60,20)
-        bias = "UP" if c1 > hh1 else ("DOWN" if c1 < ll1 else "UP")
-
-    fvg_ok, _, _, _, _ = fvg_last_soft(df15, lookback=24, use_bodies=True)
-    choch_up   = choch_soft(df5, "UP",   8, False)
-    choch_down = choch_soft(df5, "DOWN", 8, False)
-
-    side = "BUY" if bias=="UP" else "SELL"
-    entry = float(df5["Close"].iloc[-2])
-    buf   = dynamic_buffer(symbol)
-
-    lo15  = _swing_low(df15, 20)
-    hi15  = _swing_high(df15, 20)
-    if side == "BUY":
-        sl = min(entry, lo15 - buf)
-    else:
-        sl = max(entry, hi15 + buf)
-
-    mem_target = nearest_level_from_memory(symbol, side, entry)
-    if side == "BUY":
-        if mem_target is None or mem_target <= entry:
-            target = entry + max(abs(entry - sl)*0.8, TP_MIN_ABS.get(symbol,0.0))
-        else:
-            target = mem_target
-        tp = target + buf
-    else:
-        if mem_target is None or mem_target >= entry:
-            target = entry - max(abs(entry - sl)*0.8, TP_MIN_ABS.get(symbol,0.0))
-        else:
-            target = mem_target
-        tp = target - buf
-
-    tp_abs = abs(tp - entry)
-    if tp_abs < TP_MIN_ABS.get(symbol, 0.0):
-        return None
-
-    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-
-    score = 0
-    if fvg_ok: score += 20
-    if (side=="BUY" and choch_up) or (side=="SELL" and choch_down): score += 15
-    if _in_session_utc(): score += 5
-    score = max(0, min(100, score)); conf = score/100.0
-    if conf < CONF_MIN_IDEA:
-        return None
-
-    return {
-        "symbol": symbol, "tf": tf_label,
-        "side": side, "trend": bias,
-        "entry": entry, "tp": tp, "sl": sl,
-        "rr": rr, "conf": conf, "tp_abs": tp_abs, "tp_min": TP_MIN_ABS.get(symbol,0.0)
-    }
-
-# ===================== ASSIST (NG 1m) =====================
 def _atr_m1(df1m: pd.DataFrame, period: int = 14) -> float:
     d = df1m
     if d is None or d.empty or len(d) < period+2: return 0.0
@@ -636,6 +581,139 @@ def _atr_m1(df1m: pd.DataFrame, period: int = 14) -> float:
         trs.append(tr)
     return float(sum(trs[-period:]) / period) if len(trs) >= period else 0.0
 
+def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias=None):
+    """
+    HUMAN V2:
+    - MTF bias: 60m/240m.
+    - Уровни памяти (5m/15m/60m + seed из M1).
+    - Тренд-триггер: направленный ход за TREND_LOOKBACK_MIN минут.
+    - Брейкаут swing high/low 5m/15m и близость к уровням памяти.
+    """
+    if df1m is None or df1m.empty or len(df1m) < 240:
+        return None
+
+    build_level_memory(symbol, df1m)
+
+    df5   = _resample(df1m, 5)
+    df15  = _resample(df1m, 15)
+    df60  = _resample(df1m, 60)
+    df240 = _resample(df1m, 240)
+    if df5.empty or df15.empty or df60.empty or df240.empty:
+        return None
+
+    # ---- bias по старшим ----
+    c1 = float(df60["Close"].iloc[-2])
+    hh4 = _swing_high(df240, 20); ll4 = _swing_low(df240, 20)
+    if   c1 > hh4:  bias = "UP"
+    elif c1 < ll4:  bias = "DOWN"
+    else:
+        hh1 = _swing_high(df60, 20); ll1 = _swing_low(df60, 20)
+        bias = "UP" if c1 > hh1 else ("DOWN" if c1 < ll1 else "UP")
+
+    # ---- паттерны/структура ----
+    fvg_ok, _, _, _, _ = fvg_last_soft(df15, lookback=24, use_bodies=True)
+    choch_up   = choch_soft(df5, "UP",   8, False)
+    choch_down = choch_soft(df5, "DOWN", 8, False)
+
+    # ---- тренд-триггер по минуткам ----
+    atr1 = _atr_m1(df1m, 14)
+    c_now_1m  = float(df1m["Close"].iloc[-2])  # последняя ЗАКРЫТАЯ минутка
+    c_prev_1m = float(df1m["Close"].iloc[max(0, len(df1m)-2-TREND_LOOKBACK_MIN)])
+    trend_move = c_now_1m - c_prev_1m
+    trend_abs  = abs(trend_move)
+    trend_dir  = "UP" if trend_move > 0 else "DOWN"
+    trend_ok   = (atr1 >= ATR1_MIN_FOR_TREND) and (trend_abs >= TREND_MIN_MOVE)
+
+    # ---- swing уровни для брейкаута ----
+    hi5  = _swing_high(df5,  20); lo5  = _swing_low(df5,  20)
+    hi15 = _swing_high(df15, 20); lo15 = _swing_low(df15, 20)
+
+    # ---- базовая сторона: по bias; может быть перезаписана трендом ----
+    side = "BUY" if bias == "UP" else "SELL"
+
+    # если нет явных паттернов, но есть тренд — берём сторону по тренду
+    if (not fvg_ok) and (not choch_up) and (not choch_down) and trend_ok:
+        side = "BUY" if trend_dir == "UP" else "SELL"
+
+    entry = c_now_1m
+    buf   = dynamic_buffer(symbol)
+
+    # ---- SL по 15m swing ----
+    if side == "BUY":
+        sl = min(entry, lo15 - buf)
+    else:
+        sl = max(entry, hi15 + buf)
+
+    # ---- цель: ближайший уровень памяти по направлению или минимум TP_MIN_ABS ----
+    mem_target = nearest_level_from_memory(symbol, side, entry)
+    if side == "BUY":
+        if mem_target is None or mem_target <= entry:
+            target = entry + max(abs(entry - sl) * 0.8, TP_MIN_ABS.get(symbol, 0.0))
+        else:
+            target = mem_target
+        tp = target + buf
+    else:
+        if mem_target is None or mem_target >= entry:
+            target = entry - max(abs(entry - sl) * 0.8, TP_MIN_ABS.get(symbol, 0.0))
+        else:
+            target = mem_target
+        tp = target - buf
+
+    tp_abs = abs(tp - entry)
+    if tp_abs < TP_MIN_ABS.get(symbol, 0.0):
+        return None
+
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+
+    # ---- скоринг: делаем активнее, но без мусора ----
+    score = 0
+    if fvg_ok: score += 18
+    if (side == "BUY" and choch_up) or (side == "SELL" and choch_down): score += 14
+    if _in_session_utc(): score += 6
+
+    # тренд
+    if trend_ok:
+        score += 28
+        if (side == "BUY" and trend_dir == "UP") or (side == "SELL" and trend_dir == "DOWN"):
+            score += 5
+
+    # брейкауты swing уровней (близко к 5m/15m high/low)
+    near_break_up   = min(abs(entry - hi5),  abs(entry - hi15)) <= BREAK_NEAR
+    near_break_down = min(abs(entry - lo5),  abs(entry - lo15)) <= BREAK_NEAR
+    if (side == "BUY"  and near_break_up)   or \
+       (side == "SELL" and near_break_down):
+        score += 20
+
+    # импульс на последней минутке
+    H = float(df1m["High"].iloc[-2]); L = float(df1m["Low"].iloc[-2])
+    O = float(df1m["Open"].iloc[-2]); C = float(df1m["Close"].iloc[-2])
+    if (abs(C - O) >= MOMENTUM_MIN_BODY) and ((H - L) >= MOMENTUM_MIN_RANGE):
+        score += 6
+
+    # близость к уровню памяти в сторону сделки (отбой/добой)
+    mem = state["levels"].get(symbol, []) or []
+    if mem:
+        if side == "BUY":
+            near = [p for p in [L_["price"] for L_ in mem if L_["price"] <= entry] if abs(entry - p) <= LEVEL_PROX]
+            if near: score += 8
+        else:
+            near = [p for p in [L_["price"] for L_ in mem if L_["price"] >= entry] if abs(entry - p) <= LEVEL_PROX]
+            if near: score += 8
+
+    score = max(0, min(100, score))
+    conf  = score / 100.0
+    if conf < CONF_MIN_IDEA:
+        return None
+
+    return {
+        "symbol": symbol, "tf": tf_label,
+        "side": side, "trend": bias,
+        "entry": entry, "tp": tp, "sl": sl,
+        "rr": rr, "conf": conf,
+        "tp_abs": tp_abs, "tp_min": TP_MIN_ABS.get(symbol, 0.0),
+    }
+
+# ===================== ASSIST (NG 1m) =====================
 def _reset_scalp_hour():
     global scalp_trades_hour_ts, scalp_trades_hour_ct
     now = time.time()
@@ -768,13 +846,13 @@ def can_send_idea(sym: str) -> bool:
 
 def is_fresh_enough(symbol: str, entry: float, close_now: float) -> bool:
     buf = SPREAD_BUFFER.get(symbol, 0.0)
-    lim = 15.0 * buf
+    lim = 25.0 * buf   # было 15.0 — даём больше шансов зайти
     return abs(float(entry) - float(close_now)) <= lim
 
 def is_duplicate_signal(symbol: str, entry: float) -> bool:
     lastp = _last_signal_price.get(symbol)
     if lastp is None: return False
-    tol = 8.0 * SPREAD_BUFFER.get(symbol, 0.0)
+    tol = 4.0 * SPREAD_BUFFER.get(symbol, 0.0)   # было 8.0 — чаще разрешаем
     return abs(float(entry) - float(lastp)) <= tol
 
 async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
@@ -801,8 +879,26 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         post = df.iloc[(start_i + 1):]
         if not post.empty:
             side = sess["side"]; tp = sess["tp"]; sl = sess["sl"]
+
+            # ---- PARTIAL TP1 ----
+            if PARTIAL_ENABLE and not sess.get("partial_done", False):
+                tp1 = float(sess.get("tp1", sess["entry"]))
+                hit_tp1 = (post["High"].max() >= tp1) if side=="BUY" else (post["Low"].min() <= tp1)
+                if hit_tp1:
+                    asyncio.create_task(send_main(
+                        f"✅ TP1 (+{rnd('NG',TP1_PARTIAL)}) hit on {SYMBOLS[symbol]['name']} @ {rnd('NG',tp1)}\n"
+                        f"→ Закрой {int(PARTIAL_KEEP*100)}% вручную. Остаток держим. SL → BE."
+                    ))
+                    if MOVE_SL_TO_BE:
+                        buf = SPREAD_BUFFER.get(symbol, 0.0)
+                        new_sl = (sess["entry"] - buf) if side=="BUY" else (sess["entry"] + buf)
+                        sess["sl"] = float(new_sl)
+                    sess["partial_done"] = True
+                    # продолжаем сопровождать остаток
+
+            # ---- MAIN TP/SL ----
             hit_tp = (post["High"].max() >= tp) if side=="BUY" else (post["Low"].min() <= tp)
-            hit_sl = (post["Low"].min()  <= sl) if side=="BUY" else (post["High"].max() >= sl)
+            hit_sl = (post["Low"].min()  <= sess["sl"]) if side=="BUY" else (post["High"].max() >= sess["sl"])
             if hit_tp:
                 price_now = float(post["Close"].iloc[-1])
                 asyncio.create_task(notify_outcome(symbol, "TP", price_now))
@@ -839,9 +935,9 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     close_now = float(df["Close"].iloc[-1])
     entry     = float(setup["entry"])
 
-    if abs(entry - close_now) > 15.0 * buffer:
+    if not is_fresh_enough(symbol, entry, close_now):
         return
-    if _last_signal_price[symbol] is not None and abs(entry - _last_signal_price[symbol]) <= 8.0 * buffer:
+    if is_duplicate_signal(symbol, entry):
         return
 
     if conf >= CONF_MIN_IDEA and SEND_IDEAS:
@@ -860,6 +956,12 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
             "opened_at": time.time(),
             "entry_bar_idx": cur_idx,
         }
+        # анти-жадность: tp1/partial
+        if PARTIAL_ENABLE:
+            tp1_val = (setup["entry"] + TP1_PARTIAL) if setup["side"]=="BUY" else (setup["entry"] - TP1_PARTIAL)
+            trade[symbol]["tp1"] = float(tp1_val)
+            trade[symbol]["partial_done"] = False
+
         last_signal_idx[symbol] = closed_idx
         _last_signal_price[symbol] = entry
 
@@ -905,13 +1007,11 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     asyncio.create_task(engine_loop())
     asyncio.create_task(alive_loop())
-    asyncio.create_task(warmup_levels_loop())  # ← добавили
+    asyncio.create_task(warmup_levels_loop())  # подогреваем память уровней
     await dp.start_polling(bot_main)
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-

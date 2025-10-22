@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# ========= GranVex — V8.1 NG =========
+# Trend + Human + Assist (NG-only, dynamic TP/SL, Yahoo 1m)
+# Анти-пила, мягкие пороги, автосид уровней, дедуп по цене расширен
+
 import os, time, csv, logging, asyncio, random
 from datetime import datetime
 import pandas as pd
@@ -11,27 +15,23 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
 from aiogram.filters import Command
 
-# ===================== VERSION =====================
-VERSION = "V8.0 NG — Trend + Human + Assist (NG-only, dynamic TP/SL, Yahoo 1m)"
+VERSION = "V8.1 NG — Trend+Human+Assist (antichop, seeded levels)"
 
 # ===================== TOKENS / OWNER =====================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
-LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw")
-OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "YOUR_MAIN_TOKEN")
+LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "YOUR_LOG_TOKEN")
+OWNER_ID       = int(os.getenv("OWNER_ID", "111111111"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
 SYMBOLS = {"NG": {"name": "NATGAS (NG=F)", "tf": "1m"}}
 SPREAD_BUFFER = {"NG": 0.0040}
 
-# Минимальная реальная дистанция TP для HUMAN (как нижняя граница)
-TP_MIN_ABS = {"NG": 0.0150}
+TP_MIN_ABS = {"NG": 0.0150}       # нижняя граница для HUMAN
 
-# Порог уверенности для входа HUMAN
 CONF_MIN_TRADE = {"NG": 0.50}
 CONF_MIN_IDEA  = 0.05
 
-# Идеи
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
 MAX_IDEAS_PER_HOUR = 60
@@ -59,7 +59,7 @@ ROBUST_HEADERS = {
     "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Connection": "keep-alive",
 }
 
-# ====== ASSIST (мягкий фоллбек по NG 1m; НЕ отдельный режим) ======
+# ====== ASSIST (мягкий фоллбек по NG 1m) ======
 SCALP_ASSIST_ENABLED = True
 SCALP_ATR1_MIN     = 0.0040
 SCALP_MIN_IMPULSE  = 0.0020
@@ -70,14 +70,13 @@ SCALP_SL_ABS       = 0.0120
 SCALP_COOLDOWN_SEC = 1
 SCALP_MAX_PER_HOUR = 20
 
-# ====== TREND (новый слой, включён по умолчанию) ======
+# ====== TREND (включён по умолчанию, пороги смягчены) ======
 TREND_ENABLED        = True
-TREND_ATR1_MIN       = 0.0           # НЕ душим волатильностью
-TREND_LOOK_MIN       = 10            # смотрим дельту за 10 минут
-TREND_MIN_MOVE       = 0.0100        # ~10 пипсов — уже повод
-TREND_MIN_GAP_MIN    = 15            # пауза между входами тренда
-TREND_MAX_PER_DAY    = 5             # максимум тренд-входов в день
-# TP/SL в тренде динамические; эти — только мягкие рамки
+TREND_ATR1_MIN       = 0.0
+TREND_LOOK_MIN       = 8            # было 10
+TREND_MIN_MOVE       = 0.0080       # было 0.0100
+TREND_MIN_GAP_MIN    = 7            # пауза между тренд-входами
+TREND_MAX_PER_DAY    = 8            # было 5
 TREND_TP_ABS         = 0.0200
 TREND_SL_ABS         = 0.0120
 
@@ -105,12 +104,10 @@ state = {
 mode = "NG"
 requested_mode = "NG"
 
-# Память уровней
 LEVEL_MEMORY_HOURS = {"5m": 72, "15m": 72, "60m": 120}
 LEVEL_DEDUP_TOL    = {"NG": 0.003}
 LEVEL_EXPIRE_SEC   = 48 * 3600
 
-# Assist counters
 scalp_cooldown_until = 0.0
 scalp_trades_hour_ts = 0.0
 scalp_trades_hour_ct = 0
@@ -204,7 +201,6 @@ async def cmd_status(m: Message):
     nm = SYMBOLS[s]["name"]
     cd = max(0, int(cooldown_until[s]-now))
     L = len(state["levels"][s]) if isinstance(state["levels"].get(s), list) else 0
-    # маленькая выборка уровней для наглядности
     sample = [round(x["price"],3) for x in (state["levels"][s][-4:] if L else [])]
     lines.append(f"{nm}: ATR15≈{atrtxt}  open={opened}  cooldown={cd}  last_close_age={age}s  levels_mem={L}")
     lines.append(f"levels_sample: {sample if sample else '[]'}")
@@ -450,7 +446,46 @@ def format_signal(setup, buffer):
         f"RR≈{round(rr,2)}  Conf: {int(setup['conf']*100)}%  Bias: {setup['trend']}"
     )
 
-# ===================== HUMAN (умный NG) =====================
+# ========== Лёгкий «разум» ==========
+def _ema(arr, n):
+    k = 2.0/(n+1.0); ema = None; out=[]
+    for v in arr:
+        ema = v if ema is None else (v*k + ema*(1-k))
+        out.append(ema)
+    return out
+
+def _trend_strength(df1m):
+    """Сила тренда по 5m: EMA5 vs EMA20 + импульс последних 8 баров."""
+    d5 = _resample(df1m, 5)
+    if d5.empty or len(d5) < 25: return 0.0
+    c = d5["Close"].tolist()
+    e5 = _ema(c, 5)[-1]; e20 = _ema(c, 20)[-1]
+    slope = (c[-1]-c[-9])  # импульс за ~40 минут
+    sign  = 1 if e5>e20 else (-1 if e5<e20 else 0)
+    return sign * (abs(e5-e20) + slope)
+
+def _chop_guard(df1m):
+    """Антипила на 1m: 3 из 4 последних закрытий в одну сторону,
+    и последний бар не с огромными тенями (body/(high-low) >= 0.4)."""
+    d = df1m
+    if d is None or d.empty or len(d) < 6: return False
+    closes = d["Close"].values
+    opens  = d["Open"].values
+    highs  = d["High"].values
+    lows   = d["Low"].values
+    last = -1
+    seq = [(closes[i]-closes[i-1]) for i in range(last-3, last+1)]
+    up = sum(1 for x in seq if x>0)
+    dn = sum(1 for x in seq if x<0)
+    body = abs(closes[last]-opens[last]); rng = max(1e-9, highs[last]-lows[last])
+    good_body = (body/rng) >= 0.4
+    return (max(up,dn) >= 3) and good_body
+
+def _rr_ok(entry, tp, sl):
+    risk = abs(entry-sl); reward = abs(tp-entry)
+    return (risk >= 0.004) and (reward/max(risk,1e-9) >= 1.2)
+
+# ===================== HUMAN =====================
 def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias=None):
     if df1m is None or df1m.empty or len(df1m) < 240: return None
     build_level_memory(symbol, df1m)
@@ -507,11 +542,13 @@ def build_setup(df1m: pd.DataFrame, symbol: str, tf_label: str, dxy_bias=None):
     score = max(0, min(100, score)); conf = score/100.0
     if conf < CONF_MIN_IDEA: return None
 
+    if not _rr_ok(entry, tp, sl): return None
+
     return {"symbol": symbol, "tf": tf_label, "side": side, "trend": bias,
             "entry": entry, "tp": tp, "sl": sl, "rr": rr, "conf": conf,
             "tp_abs": tp_abs, "tp_min": TP_MIN_ABS.get(symbol,0.0), "kind":"HUMAN"}
 
-# ===================== TREND (новый) =====================
+# ===================== TREND =====================
 def _trend_reset_if_new_day():
     d = datetime.utcnow().date().isoformat()
     if state["trend_day"]["date"] != d:
@@ -519,7 +556,11 @@ def _trend_reset_if_new_day():
 
 def build_trend_setup_ng(df1m: pd.DataFrame) -> dict | None:
     if not TREND_ENABLED: return None
-    if df1m is None or df1m.empty or len(df1m) < TREND_LOOK_MIN + 20:
+    if df1m is None or df1m.empty or len(df1m) < TREND_LOOK_MIN + 30:
+        return None
+
+    # Антипила: последние бары согласованы и тело адекватное
+    if not _chop_guard(df1m):
         return None
 
     # импульс за LOOK_MIN
@@ -529,6 +570,11 @@ def build_trend_setup_ng(df1m: pd.DataFrame) -> dict | None:
     if abs(delta) < TREND_MIN_MOVE:
         return None
     side = "BUY" if delta > 0 else "SELL"
+
+    # Сила тренда на 5m
+    ts = _trend_strength(df1m)
+    if (side == "BUY" and ts <= 0) or (side == "SELL" and ts >= 0):
+        return None
 
     # анти-спам: лимит на день и пауза
     _trend_reset_if_new_day()
@@ -557,7 +603,7 @@ def build_trend_setup_ng(df1m: pd.DataFrame) -> dict | None:
     risk = abs(entry - sl)
     if risk < 0.004 or risk > 0.025: return None
 
-    # TP — ближайший уровень по направлению или RR≈1.6*risk
+    # TP — ближайший уровень или RR≈1.6*risk
     build_level_memory("NG", df1m)
     mem_target = nearest_level_from_memory("NG", side, entry)
 
@@ -578,6 +624,8 @@ def build_trend_setup_ng(df1m: pd.DataFrame) -> dict | None:
     tp_abs = abs(tp - entry)
     if tp_abs < 0.010: return None
 
+    if not _rr_ok(entry, tp, sl): return None
+
     rr = tp_abs / max(risk,1e-9)
     base = 0.62
     if _in_session_utc(): base += 0.04
@@ -587,11 +635,10 @@ def build_trend_setup_ng(df1m: pd.DataFrame) -> dict | None:
     setup = {"symbol":"NG","tf":"1m","side":side,"trend": "UP" if side=="BUY" else "DOWN",
              "entry": entry,"tp": tp,"sl": sl,"rr": rr,"conf": conf,
              "tp_abs": tp_abs,"tp_min": 0.010, "kind":"TREND"}
-    # метим попытку (для паузы после фактического входа)
     state["trend_day"]["last_ts"] = time.time()
     return setup
 
-# ===================== ASSIST (NG 1m) =====================
+# ===================== ASSIST =====================
 def _reset_scalp_hour():
     global scalp_trades_hour_ts, scalp_trades_hour_ct
     now = time.time()
@@ -697,12 +744,15 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     df = await get_df(session, symbol)
     if df.empty or len(df) < 240: return
 
+    # гарантированно обновим уровни, чтобы HUMAN/TREND не молчали в прогреве
+    build_level_memory("NG", df)
+
     cur_idx = len(df) - 1
     closed_idx = cur_idx - 1
     if closed_idx <= last_seen_idx[symbol]: return
     last_seen_idx[symbol] = closed_idx
 
-    # если есть открытая — проверяем TP/SL
+    # есть открытая — проверяем TP/SL
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))
@@ -744,15 +794,15 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     close_now = float(df["Close"].iloc[-1])
     entry     = float(setup["entry"])
 
+    # расширили допуск по близости цены и дедуп по цене
     if abs(entry - close_now) > 15.0 * buffer: return
-    if _last_signal_price[symbol] is not None and abs(entry - _last_signal_price[symbol]) <= 8.0 * buffer:
+    if _last_signal_price[symbol] is not None and abs(entry - _last_signal_price[symbol]) <= 12.0 * buffer:
         return
 
-    if conf >= CONF_MIN_IDEA and SEND_IDEAS:
+    if conf >= CONF_MIN_IDEA and SEND_IDEAS and can_send_idea(symbol):
         now = time.time()
-        if (IDEA_COOLDOWN_SEC == 0 or now - _last_idea_ts[symbol] >= IDEA_COOLDOWN_SEC):
-            await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
-            _last_idea_ts[symbol] = now
+        await send_main("🧠 IDEA:\n" + format_signal(setup, buffer))
+        _last_idea_ts[symbol] = now
 
     if conf >= conf_thr and (setup["tp_abs"] >= setup["tp_min"]):
         await send_main(format_signal(setup, buffer))
@@ -764,13 +814,11 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         last_signal_idx[symbol] = closed_idx
         _last_signal_price[symbol] = entry
 
-        # обновим счётчик тренда, если вход был трендовый
         if setup.get("kind") == "TREND":
             _trend_reset_if_new_day()
             state["trend_day"]["count"] += 1
             state["trend_day"]["last_ts"] = time.time()
 
-        # ассист частотный кулдаун
         scalp_trades_hour_ct += 1
         scalp_cooldown_until = time.time() + SCALP_COOLDOWN_SEC
         return
@@ -797,11 +845,14 @@ async def alive_loop():
         try:
             async with aiohttp.ClientSession() as s:
                 df_ng  = await get_df(s, "NG")
+            # сидируем уровни сразу, чтобы levels_mem не был 0 на старте
+            if not df_ng.empty:
+                build_level_memory("NG", df_ng)
+
             c_ng  = float(df_ng["Close"].iloc[-1])  if not df_ng.empty else 0.0
             a_ng  = _atr_m15(df_ng)  if not df_ng.empty else 0.0
             state["atr_NG"]  = rnd("NG", a_ng)
             Lng = len(state["levels"]["NG"])
-            # покажем пару уровней как sample
             sample = [round(x["price"],3) for x in (state["levels"]["NG"][-4:] if Lng else [])]
             msg = (f"[ALIVE] NG: {rnd('NG',c_ng)}, ATR15: {rnd('NG',a_ng)} (mem:{Lng}). "
                    f"levels_sample: {sample if sample else '[]'}. Status: OK.")

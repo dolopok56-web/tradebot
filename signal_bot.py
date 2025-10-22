@@ -18,9 +18,9 @@ from aiogram.filters import Command
 VERSION = "V8.1 NG — Trend+Human+Assist (antichop, seeded levels)"
 
 # ===================== TOKENS / OWNER =====================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "YOUR_MAIN_TOKEN")
-LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "YOUR_LOG_TOKEN")
-OWNER_ID       = int(os.getenv("OWNER_ID", "111111111"))
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
+LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  "8073073724:AAHGuUPg9s_oRsH24CpLUu-5udWagAB4eaw")
+OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 # ===================== MARKETS / SETTINGS =====================
@@ -873,3 +873,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

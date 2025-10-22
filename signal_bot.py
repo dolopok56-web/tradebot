@@ -29,7 +29,7 @@ SPREAD_BUFFER = {"NG": 0.0040}
 
 TP_MIN_ABS = {"NG": 0.0120}       # нижняя граница для HUMAN
 
-CONF_MIN_TRADE = {"NG": 0.45}
+CONF_MIN_TRADE = {"NG": 0.40}
 CONF_MIN_IDEA  = 0.0120
 
 SEND_IDEAS         = True
@@ -61,22 +61,22 @@ ROBUST_HEADERS = {
 
 # ====== ASSIST (мягкий фоллбек по NG 1m) ======
 SCALP_ASSIST_ENABLED = True
-SCALP_ATR1_MIN     = 0.0040
-SCALP_MIN_IMPULSE  = 0.0020
-SCALP_MIN_BODY     = 0.0010
-SCALP_NEAR_BREAK   = 0.0015
-SCALP_TP_ABS       = 0.0200
+SCALP_ATR1_MIN     = 0.0000
+SCALP_MIN_IMPULSE  = 0.0015
+SCALP_MIN_BODY     = 0.0006
+SCALP_NEAR_BREAK   = 0.0030
+SCALP_TP_ABS       = 0.0180
 SCALP_SL_ABS       = 0.0120
-SCALP_COOLDOWN_SEC = 1
-SCALP_MAX_PER_HOUR = 20
+SCALP_COOLDOWN_SEC = 0
+SCALP_MAX_PER_HOUR = 40
 
 # ====== TREND (включён по умолчанию, пороги смягчены) ======
 TREND_ENABLED        = True
 TREND_ATR1_MIN       = 0.0
-TREND_LOOK_MIN       = 8            # было 10
-TREND_MIN_MOVE       = 0.0080       # было 0.0100
+TREND_LOOK_MIN       = 1            # было 10
+TREND_MIN_MOVE       = 0.0070       # было 0.0100
 TREND_MIN_GAP_MIN    = 1            # пауза между тренд-входами
-TREND_MAX_PER_DAY    = 8            # было 5
+TREND_MAX_PER_DAY    = 12            # было 5
 TREND_TP_ABS         = 0.0200
 TREND_SL_ABS         = 0.0120
 
@@ -873,6 +873,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 
 

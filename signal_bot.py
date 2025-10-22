@@ -27,10 +27,10 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 SYMBOLS = {"NG": {"name": "NATGAS (NG=F)", "tf": "1m"}}
 SPREAD_BUFFER = {"NG": 0.0040}
 
-TP_MIN_ABS = {"NG": 0.0150}       # нижняя граница для HUMAN
+TP_MIN_ABS = {"NG": 0.0120}       # нижняя граница для HUMAN
 
 CONF_MIN_TRADE = {"NG": 0.50}
-CONF_MIN_IDEA  = 0.05
+CONF_MIN_IDEA  = 0.0120
 
 SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
@@ -75,7 +75,7 @@ TREND_ENABLED        = True
 TREND_ATR1_MIN       = 0.0
 TREND_LOOK_MIN       = 8            # было 10
 TREND_MIN_MOVE       = 0.0080       # было 0.0100
-TREND_MIN_GAP_MIN    = 7            # пауза между тренд-входами
+TREND_MIN_GAP_MIN    = 1            # пауза между тренд-входами
 TREND_MAX_PER_DAY    = 8            # было 5
 TREND_TP_ABS         = 0.0200
 TREND_SL_ABS         = 0.0120
@@ -873,4 +873,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

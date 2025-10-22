@@ -29,7 +29,7 @@ SPREAD_BUFFER = {"NG": 0.0040}
 
 TP_MIN_ABS = {"NG": 0.0120}       # нижняя граница для HUMAN
 
-CONF_MIN_TRADE = {"NG": 0.50}
+CONF_MIN_TRADE = {"NG": 0.45}
 CONF_MIN_IDEA  = 0.0120
 
 SEND_IDEAS         = True
@@ -873,5 +873,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 
 

@@ -16,8 +16,8 @@ from aiogram.types import Message
 from aiogram.filters import Command
 
 # ---------------- CFG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_TELEGRAM_BOT_TOKEN")
-CHAT_ID   = int(os.getenv("CHAT_ID", "123456789"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
+CHAT_ID   = int(os.getenv("CHAT_ID", "6784470762"))
 
 SYMBOLS = {
     "NG":   {"yahoo":"NG=F",    "name":"NATGAS (NG=F)", "pip":0.001, "buf":0.0040, "tp_min":0.015, "sl_min":0.006},
@@ -325,3 +325,4 @@ async def main():
 if __name__ == "__main__":
     try: asyncio.run(main())
     except (KeyboardInterrupt, SystemExit): pass
+

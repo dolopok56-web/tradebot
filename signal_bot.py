@@ -31,7 +31,7 @@ SYMBOLS = {"XAU": {"name": "GOLD (XAUUSD)", "tf": "1m"}}
 SPREAD_BUFFER = {"XAU": 0.05}   # подстрой под своего брокера
 TP_MIN_ABS    = {"XAU": 4.0}    # минимум 4 пункта — как просил
 
-CONF_MIN_TRADE = {"XAU": 0.50}
+CONF_MIN_TRADE = {"XAU": 0.00}
 CONF_MIN_IDEA  = 0.00
 
 SEND_IDEAS         = True
@@ -89,14 +89,14 @@ LEVEL_DEDUP_TOL    = {"XAU": 0.30}
 LEVEL_EXPIRE_SEC   = 48 * 3600
 
 # Частота сигналов
-BREAK_LOOKBACK_N = 15
-RETEST_ALLOW     = True
+BREAK_LOOKBACK_N = 10
+RETEST_ALLOW     = False
 RETEST_TOL       = 0.25
-MAX_TP_CAP       = 50.0
-MIN_SL_ABS       = 3.0
+MAX_TP_CAP       = 20.0
+MIN_SL_ABS       = 2.0
 MAX_RISK_ABS     = 30.0
-ENTRY_PROX_MULT  = 10.0
-DEDUP_PROX_MULT  = 8.0
+ENTRY_PROX_MULT  = 20.0
+DEDUP_PROX_MULT  = 4.0
 
 # ===================== TELEGRAM =====================
 
@@ -676,3 +676,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

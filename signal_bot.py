@@ -13,7 +13,7 @@ from aiogram.filters import Command
 VERSION = "Turbo Impuls V2 — NG-only, Impulse + Pullback, signals-only"
 
 # ===================== TOKENS / OWNER =====================
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "REPLACE_TELEGRAM_TOKEN")
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
 OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
@@ -315,3 +315,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

@@ -317,8 +317,10 @@ def extract_levels(df: pd.DataFrame, tf_label: str, lookback_hours: int, now_ts:
         return []
     bars = _bars_for_hours(tf_label, lookback_hours)
     d = df.tail(max(bars, 30)).copy()
-    out = []; n = len(d); if n < 10: return out
-    k = 3
+    out = []
+    n = len(d)
+        if n < 10:
+    return out
     for i in range(k, n-k):
         hi = float(d["High"].iloc[i]); lo = float(d["Low"].iloc[i])
         if kind == "HH":
@@ -640,3 +642,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

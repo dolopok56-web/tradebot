@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# ========= GranVex — V9.0 GOLD =========
-# XAUUSD-only, Yahoo 1m feed, simple breakout + levels.
-# No ATR/RR gating. Sends Telegram signals only.
+# ========= GranVex — V9.1 GOLD =========
+# XAUUSD-only, Yahoo 1m feed, breakout+levels, min TP=4p
+# Анти-молчание: несколько тикеров фида, лог "[FEED]" в Telegram.
 
 import os, time, csv, logging, asyncio, random
 from datetime import datetime
@@ -15,7 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
 from aiogram.filters import Command
 
-VERSION = "V9.0 GOLD — breakout+levels, min TP 4p"
+VERSION = "V9.1 GOLD — breakout+levels, min TP 4p, multi-feed"
 
 # ===================== TOKENS / OWNER =====================
 
@@ -28,8 +28,8 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
 SYMBOLS = {"XAU": {"name": "GOLD (XAUUSD)", "tf": "1m"}}
 
-SPREAD_BUFFER = {"XAU": 0.05}   # tune to your broker
-TP_MIN_ABS    = {"XAU": 4.0}    # your requirement: minimum 4 points
+SPREAD_BUFFER = {"XAU": 0.05}   # подстрой под своего брокера
+TP_MIN_ABS    = {"XAU": 4.0}    # минимум 4 пункта — как просил
 
 CONF_MIN_TRADE = {"XAU": 0.50}
 CONF_MIN_IDEA  = 0.00
@@ -38,7 +38,7 @@ SEND_IDEAS         = True
 IDEA_COOLDOWN_SEC  = 0
 MAX_IDEAS_PER_HOUR = 120
 
-LONDON_HOURS = range(7, 15)   # UTC sessions boost
+LONDON_HOURS = range(7, 15)   # UTC
 NY_HOURS     = range(12, 21)
 
 POLL_SEC        = 0.35
@@ -88,7 +88,7 @@ LEVEL_MEMORY_HOURS = {"5m": 72, "15m": 72, "60m": 120}
 LEVEL_DEDUP_TOL    = {"XAU": 0.30}
 LEVEL_EXPIRE_SEC   = 48 * 3600
 
-# Signal frequency knobs
+# Частота сигналов
 BREAK_LOOKBACK_N = 15
 RETEST_ALLOW     = True
 RETEST_TOL       = 0.25
@@ -118,6 +118,12 @@ async def send_log(text: str):
     except Exception as e:
         logging.error(f"send_log error: {e}")
 
+async def log_feed(msg: str):
+    try:
+        await bot_log.send_message(TARGET_CHAT_ID, f"[FEED] {msg}")
+    except:
+        pass
+
 def mode_title(_: str) -> str:
     return "GOLD (XAUUSD)"
 
@@ -130,8 +136,8 @@ async def _request_mode(new_mode: str, m: Message | None = None):
 
 @router.message(Command("start"))
 async def cmd_start(m: Message):
-    await m.answer(f"✅ Bot is alive ({VERSION}).\nType 'команды' to see commands.")
-    await m.answer(f"✅ Current mode: {mode_title(mode)}.")
+    await m.answer(f"✅ Bot is alive ({VERSION}).\nНапиши 'команды' чтобы увидеть список.")
+    await m.answer(f"✅ Текущий режим: {mode_title(mode)}.")
 
 @router.message(F.text.lower() == "команды")
 async def cmd_help(m: Message):
@@ -242,14 +248,37 @@ async def get_df(session: aiohttp.ClientSession, symbol: str) -> pd.DataFrame:
     cache_ttl = 0.40
     if c and (now_ts - c["ts"] < cache_ttl) and isinstance(c.get("df"), pd.DataFrame) and not c["df"].empty:
         return c["df"]
-    if symbol == "XAU":
-        for t in ("XAUUSD=X",):
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=5d"
-            df = _df_from_yahoo_v8(await _yahoo_json(session, url))
-            if not df.empty:
-                last_candle_close_ts["XAU"] = time.time()
-                _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed":"yahoo"}
-                return df
+
+    if symbol != "XAU":
+        return pd.DataFrame()
+
+    # кандидаты фида: spot, альтернативный spot, фьючерс
+    candidates = [
+        ("XAUUSD=X", "spot-main"),
+        ("XAU=X",    "spot-alt"),
+        ("GC=F",     "futures"),
+    ]
+
+    for t, tag in candidates:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{t}"
+            f"?interval=1m&range=5d&includePrePost=true&corsDomain=finance.yahoo.com"
+        )
+        payload = await _yahoo_json(session, url)
+        df = _df_from_yahoo_v8(payload)
+        if not df.empty:
+            last_candle_close_ts["XAU"] = time.time()
+            _prices_cache["XAU"] = {"ts": now_ts, "df": df, "feed": f"yahoo:{tag}:{t}"}
+            try:
+                last = float(df["Close"].iloc[-1])
+            except Exception:
+                last = 0.0
+            await log_feed(f"OK via {tag} ({t}) last={round(last,2)} rows={len(df)}")
+            return df
+        else:
+            await log_feed(f"EMPTY via {tag} ({t})")
+
+    await log_feed("ALL CANDIDATES EMPTY — check network/DNS/SSL")
     return pd.DataFrame()
 
 # ===================== UTILS / LEVELS =====================
@@ -387,10 +416,9 @@ def format_signal(setup, buffer):
         f"Entry: {rnd(sym,setup['entry'])}  SpreadBuf≈{rnd(sym,buffer)}"
     )
 
-# ========== Gold logic (no ATR/RR gating) ==========
+# ========== ЛОГИКА GOLD (без ATR/RR) ==========
 
 def build_setup_xau(df1m: pd.DataFrame) -> dict | None:
-    # Breakout of last N bars' high/low + optional retest.
     if df1m is None or df1m.empty or len(df1m) < max(60, BREAK_LOOKBACK_N+5):
         return None
 
@@ -405,7 +433,7 @@ def build_setup_xau(df1m: pd.DataFrame) -> dict | None:
     close_now = float(df1m["Close"].iloc[i_close])
     buf = dynamic_buffer("XAU")
 
-    # Use last CLOSED bar for breakout check
+    # Пробой по последнему ЗАКРЫТОМУ бару
     closed = df1m.iloc[:-1]
     if len(closed) < BREAK_LOOKBACK_N + 2:
         return None
@@ -432,7 +460,7 @@ def build_setup_xau(df1m: pd.DataFrame) -> dict | None:
     if side is None:
         return None
 
-    # SL via 15m swing, bounded
+    # SL по свингу 15m с границами
     if side == "BUY":
         swing_lo = _swing_low(df15, 20)
         sl = min(entry - 1e-6, swing_lo - buf)
@@ -447,7 +475,7 @@ def build_setup_xau(df1m: pd.DataFrame) -> dict | None:
     if risk < MIN_SL_ABS or risk > MAX_RISK_ABS:
         return None
 
-    # TP by nearest memory level or risk-based, with caps
+    # TP — ближайший уровень или фикс от риска; минимум 4п, кап 50п
     mem_target = nearest_level_from_memory("XAU", side, entry)
     if side == "BUY":
         if mem_target is None or mem_target <= entry:
@@ -462,7 +490,7 @@ def build_setup_xau(df1m: pd.DataFrame) -> dict | None:
             tp_raw = min(mem_target, entry - TP_MIN_ABS["XAU"])
         tp = max(tp_raw, entry - MAX_TP_CAP)
 
-    # proximity + dedup
+    # близость к цене + дедуп
     if abs(entry - close_now) > ENTRY_PROX_MULT * buf:
         return None
 
@@ -547,7 +575,7 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         return
     last_seen_idx[symbol] = closed_idx
 
-    # check TP/SL for open idea
+    # Проверка TP/SL
     sess = trade[symbol]
     if sess:
         start_i = int(sess.get("entry_bar_idx", cur_idx))

@@ -2,188 +2,134 @@
 # -*- coding: utf-8 -*-
 
 """
-GranVex NG — Stable Impulse v1.0
-— только NATGAS (NG=F), поток Yahoo (1m)
-— сигнал = импульс за 3–7 мин + направленный контекст
-— TP/SL динамика: 1.5R (минимум 0.015, максимум 0.040)
-— анти-спам: окна, лимиты, охлаждение
-— только СИГНАЛЫ в Telegram (никаких "рефов" и лишних режимов)
+NG SIGNAL BOT — IMPULSE+TREND (NO XTB API)
+- Источник цен: Yahoo Finance (NG=F), 1m, с ретраями
+- Сдвиг под брокера: /ref 4.040 (или "реф 4.040") -> сохраняется в config.json
+- Сигналы: 1) импульс + подтверждение, 2) тренд-подтягивание, 3) мягкий ассист
+- TP/SL: TP 0.015–0.040, SL за ближайший свинг 5m (минимум ~0.008)
+- Частотный лимит: по умолчанию 8/день, пауза 5 минут между сигналами
+- Команды: /start, статус, газ, лимит N, турбо вкл/выкл, реф X.XXX, тест
 """
 
-import os, time, asyncio, random, logging, math
-from datetime import datetime, timedelta
+import os, json, time, math, random, asyncio, logging
+from datetime import datetime, date
+import aiohttp, pandas as pd
 
-import pandas as pd
-import aiohttp
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.filters import Command
 
-# ================== BASIC CONFIG ==================
-VERSION = "GranVex NG — Stable Impulse v1.0"
+# ------------- CONFIG / STATE -------------
+VERSION = "NG-IMPULSE v1.0 (Yahoo 1m, TP15-40, RR~1.4-1.8)"
+SYMBOL = "NG"             # внутр. имя
+YAHOO_TICKER = "NG=F"     # источник
+SPREAD_BUF = 0.0040       # буфер к TP/SL
+TP_MIN = 0.0150
+TP_MAX = 0.0400
+SL_MIN = 0.0080
+RR_TARGET = 1.5
 
-# set these 2 (или через переменные окружения)
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "<7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs>")
-TARGET_CHAT_ID = int(os.getenv("6784470762", "0"))   # твой Telegram ID (или чат)
+# Частота
+DAY_LIMIT_DEFAULT = 8
+COOLDOWN_MIN = 5*60
 
-SYMBOL = "NG"                 # единственный рынок
-Y_SYMBOL = "NG=F"            # тикер Yahoo
-TF = "1m"
+# Турбо-фильтры (чтобы не молчал)
+IMP_LOOK_MIN = 5          # минут смотреть дельту
+IMP_MOVE_MIN = 0.0100     # импульс за окно
+BODY_MIN = 0.0060         # тело последней свечи 1m
+ATR1_MIN_ASSIST = 0.0040  # ассист включается когда хоть как-то шевелится
 
-# небольшая корректировка разницы фьюч/CFD, если нужно (можно оставить 0.0)
-OFFSET = float(os.getenv("NG_OFFSET", "0.0000"))
+CONFIG_FILE = "config.json"
 
-# частота опроса и “сердцебиение”
-POLL_SEC        = 0.35
-ALIVE_EVERY_SEC = 300
+# ------------- TOKENS -------------
+MAIN_BOT_TOKEN = os.getenv("7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs", "")
+TARGET_CHAT_ID = int(os.getenv("6784470762", "0"))
 
-# лимиты сигналов
-DAILY_MAX_SIGNALS = 8
-MIN_GAP_MIN       = 4          # пауза между сигналами (мин)
+if not MAIN_BOT_TOKEN or TARGET_CHAT_ID == 0:
+    raise SystemExit("⚠️ Укажи MAIN_BOT_TOKEN и TARGET_CHAT_ID в переменных окружения.")
 
-# буфер спреда для округлений (чтобы не попадать в bid/ask)
-SPREAD_BUF = 0.0040
-
-# ============ IMPULSE RULES (мягкие, без ATR-задушки) ============
-IMP_LOOK_MIN   = 3     # минимум минут для импульса
-IMP_LOOK_MAX   = 7     # максимум минут для импульса
-IMP_MOVE_MIN   = 0.010 # 10 пипсов — этого достаточно, не жадничаем
-
-# дополнительный фильтр “контекста” (чтобы не брать в стену):
-SWING_LKB_5M   = 20    # свинг на 5m для SL
-RR_TARGET      = 1.5   # целевой RR
-TP_MIN_ABS     = 0.015
-TP_MAX_ABS     = 0.040
-RISK_MIN       = 0.006 # чтобы SL не был микроскопическим
-RISK_MAX       = 0.030 # и не был конским
-
-# fallback, если долго тишина — разрешим сигнал при чуть меньшем импульсе
-QUIET_MINUTES_FOR_FALLBACK = 20
-FALLBACK_MOVE_MIN          = 0.008  # 8 пипсов через 20 мин молчания
-
-# ================== TELEGRAM ==================
+# ------------- TELEGRAM -------------
 router = Router()
 bot = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher()
 dp.include_router(router)
 
 async def say(text: str):
-    if TARGET_CHAT_ID == 0: return
-    try:
-        await bot.send_message(TARGET_CHAT_ID, text)
-    except Exception as e:
-        logging.error(f"telegram send error: {e}")
+    try: await bot.send_message(TARGET_CHAT_ID, text)
+    except Exception as e: logging.error(f"send err: {e}")
 
-@router.message(Command("start"))
-async def cmd_start(m: Message):
-    await m.answer(f"✅ {VERSION}\nРаботаю по {Y_SYMBOL} (Yahoo 1m).")
-    await m.answer("Команды: статус, стоп, тест, оффсет <число>")
+# ------------- PERSIST CONFIG -------------
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try: return json.load(open(CONFIG_FILE,"r",encoding="utf-8"))
+        except: pass
+    return {
+        "broker_offset": 0.0,
+        "day_limit": DAY_LIMIT_DEFAULT,
+        "turbo": True,
+        "signals_today": 0,
+        "day": date.today().isoformat(),
+        "last_signal_ts": 0.0
+    }
 
-@router.message(lambda m: m.text and m.text.lower().startswith("оффсет"))
-async def cmd_offset(m: Message):
-    global OFFSET
-    try:
-        parts = m.text.split(maxsplit=1)
-        if len(parts) == 2:
-            OFFSET = float(parts[1].replace(",", "."))
-            await m.answer(f"OFFSET обновлён: {OFFSET:+.4f}")
-        else:
-            await m.answer(f"Текущий OFFSET: {OFFSET:+.4f}")
-    except:
-        await m.answer("Формат: оффсет 0.0123")
+def save_config(cfg: dict):
+    json.dump(cfg, open(CONFIG_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
 
-@router.message(lambda m: m.text and m.text.lower() == "стоп")
-async def cmd_stop(m: Message):
-    state["cooldown_until"] = time.time() + 5
-    await m.answer("🛑 Остановил на 5 сек. Открытых нет (мы только шлём сигналы).")
+CFG = load_config()
 
-@router.message(lambda m: m.text and m.text.lower() == "статус")
-async def cmd_status(m: Message):
-    s = state
-    last_age = int(time.time() - s["last_close_ts"]) if s["last_close_ts"] else -1
-    last_sig_age = int(time.time() - s["last_signal_ts"]) if s["last_signal_ts"] else -1
-    lines = [
-        f"mode: NG-only ({Y_SYMBOL})",
-        f"alive: OK | poll={POLL_SEC}s",
-        f"signals_today: {s['signals_today']}/{DAILY_MAX_SIGNALS}",
-        f"last_close_age={last_age}s last_signal_age={last_sig_age}s",
-        f"cooldown_left={max(0,int(s['cooldown_until']-time.time()))}s",
-        f"OFFSET={OFFSET:+.4f}",
-    ]
-    await m.answer("```\n" + "\n".join(lines) + "\n```")
+def reset_day_if_needed():
+    d = date.today().isoformat()
+    if CFG.get("day") != d:
+        CFG["day"] = d
+        CFG["signals_today"] = 0
+        save_config(CFG)
 
-@router.message(lambda m: m.text and m.text.lower() == "тест")
-async def cmd_test(m: Message):
-    await m.answer("🔥 BUY NATGAS (NG=F) | 1m\n✅ TP: **4.1234**\n🟥 SL: **4.1111**\nEntry: 4.1155  RR≈1.5  (DEMO)")
+# ------------- PRICE FEED -------------
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/119.0 Safari/537.36)")
 
-# ================== DATA FEED (Yahoo v8) ==================
-ROBUST_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"),
-    "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Connection": "keep-alive",
-}
-HTTP_TIMEOUT   = 12
-Y_RETRIES      = 5
-Y_BACKOFF0     = 0.8
-Y_JITTER       = 0.35
-
-_prices_cache = {"ts": 0.0, "df": pd.DataFrame()}
-
-async def _yjson(session: aiohttp.ClientSession, url: str) -> dict:
-    backoff = Y_BACKOFF0
-    for _ in range(Y_RETRIES):
+async def yahoo_json(session: aiohttp.ClientSession, url: str, retries=4) -> dict:
+    back = 0.8
+    for _ in range(retries):
         try:
-            async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
+            async with session.get(url, headers={"User-Agent":UA}, timeout=15) as r:
                 if r.status == 200:
                     return await r.json(content_type=None)
-                if r.status in (429, 503):
-                    await asyncio.sleep(backoff + random.random()*Y_JITTER)
-                    backoff *= 1.7
-                    continue
-                return {}
+                if r.status in (429,503):
+                    await asyncio.sleep(back + random.random()*0.3); back *= 1.6
+                else:
+                    await asyncio.sleep(0.5)
         except:
-            await asyncio.sleep(backoff + random.random()*Y_JITTER)
-            backoff *= 1.6
+            await asyncio.sleep(back + random.random()*0.3); back *= 1.5
     return {}
 
-def _df_from_yahoo(payload: dict) -> pd.DataFrame:
+def df_from_yahoo(payload: dict) -> pd.DataFrame:
     try:
-        res = payload.get("chart", {}).get("result", [])[0]
-        ts = res.get("timestamp", [])
-        q  = res.get("indicators", {}).get("quote", [])[0]
+        r = payload.get("chart",{}).get("result",[{}])[0]
+        ts = r.get("timestamp",[])
+        q  = r.get("indicators",{}).get("quote",[{}])[0]
         if not ts or not q: return pd.DataFrame()
         df = pd.DataFrame({
-            "Open":  q.get("open",  []),
-            "High":  q.get("high",  []),
-            "Low":   q.get("low",   []),
-            "Close": q.get("close", []),
-        }, index=pd.to_datetime(ts, unit="s"))
-        df = df.ffill().bfill().dropna()
-        for c in ("Open","High","Low","Close"):
-            df = df[df[c] > 0]
-        return df.tail(2000).reset_index(drop=True)
+            "Open":  q.get("open",[]),
+            "High":  q.get("high",[]),
+            "Low":   q.get("low",[]),
+            "Close": q.get("close",[]),
+        })
+        df = df.dropna().reset_index(drop=True)
+        for col in ("Open","High","Low","Close"):
+            df = df[df[col] > 0]
+        return df.tail(1200).reset_index(drop=True)
     except:
         return pd.DataFrame()
 
-async def get_df(session: aiohttp.ClientSession) -> pd.DataFrame:
-    now = time.time()
-    if now - _prices_cache["ts"] < 0.35 and not _prices_cache["df"].empty:
-        return _prices_cache["df"]
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{Y_SYMBOL}?interval=1m&range=5d"
-    payload = await _yjson(session, url)
-    df = _df_from_yahoo(payload)
-    if not df.empty:
-        _prices_cache["ts"] = now
-        _prices_cache["df"] = df
-    return df
+async def get_df(session) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{YAHOO_TICKER}?interval=1m&range=5d"
+    return df_from_yahoo(await yahoo_json(session, url))
 
-# ================== TOOLS ==================
-def rnd(x: float) -> float:
-    return round(float(x), 4)
-
-def resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    if df.empty: return pd.DataFrame()
+# ------------- TECH -------------
+def resample(df: pd.DataFrame, minutes:int) -> pd.DataFrame:
+    if df.empty: return df
     end = pd.Timestamp.utcnow().floor("min")
     idx = pd.date_range(end - pd.Timedelta(minutes=len(df)-1), periods=len(df), freq="1min")
     z = df.copy(); z.index = idx
@@ -195,157 +141,226 @@ def resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     r.columns = ["Open","High","Low","Close"]
     return r.reset_index(drop=True)
 
-def swing_high(df: pd.DataFrame, lookback: int = 20) -> float:
-    i = len(df) - 2
-    L = max(0, i - lookback + 1)
+def swing_high(df, look=20):
+    i = len(df)-2; L = max(0, i-look+1); 
     return float(df["High"].iloc[L:i+1].max())
 
-def swing_low(df: pd.DataFrame, lookback: int = 20) -> float:
-    i = len(df) - 2
-    L = max(0, i - lookback + 1)
+def swing_low(df, look=20):
+    i = len(df)-2; L = max(0, i-look+1); 
     return float(df["Low"].iloc[L:i+1].min())
 
-# ================== STATE ==================
-state = {
-    "last_close_ts": 0.0,
-    "last_signal_ts": 0.0,
-    "signals_today": 0,
-    "day": datetime.utcnow().date().isoformat(),
-    "cooldown_until": 0.0,
-}
+def atr1m(df: pd.DataFrame, period=14) -> float:
+    if df is None or df.empty or len(df) < period+2: return 0.0
+    H = df["High"].values; L = df["Low"].values; C = df["Close"].values
+    trs = []
+    for i in range(1,len(C)):
+        tr = max(H[i]-L[i], abs(H[i]-C[i-1]), abs(L[i]-C[i-1]))
+        trs.append(tr)
+    return float(sum(trs[-period:]) / period) if len(trs)>=period else 0.0
 
-def reset_if_new_day():
-    d = datetime.utcnow().date().isoformat()
-    if state["day"] != d:
-        state["day"] = d
-        state["signals_today"] = 0
-        state["last_signal_ts"] = 0.0
+# ------------- SIGNAL LOGIC -------------
+def fmt(x: float) -> str:
+    return f"{x:.4f}"
 
-# ================== SIGNAL LOGIC ==================
-def build_signal(df1m: pd.DataFrame) -> dict | None:
-    """Импульс за 3–7 минут + SL по свингу 5m, TP≈1.5R, рамки 0.015..0.040"""
-
-    if df1m is None or df1m.empty or len(df1m) < 60:
-        return None
-
-    # 1) ищем импульс
-    last_close = float(df1m["Close"].iloc[-1])
-    chosen_look = None
-    delta = 0.0
-    now_ts = time.time()
-
-    # если давно тишина — разрешаем чуть меньший порог
-    quiet = (now_ts - (state["last_signal_ts"] or 0)) >= QUIET_MINUTES_FOR_FALLBACK*60
-    min_move = FALLBACK_MOVE_MIN if quiet else IMP_MOVE_MIN
-
-    for look in range(IMP_LOOK_MIN, IMP_LOOK_MAX+1):
-        c_look = float(df1m["Close"].iloc[-(look+1)])
-        d = last_close - c_look
-        if abs(d) >= min_move:
-            chosen_look = look
-            delta = d
-            break
-
-    if chosen_look is None:
-        return None
-
-    side = "BUY" if delta > 0 else "SELL"
-    entry = last_close + OFFSET   # при необходимости можно подровнять CFD
-
-    # 2) строим 5m для свинга
-    df5 = resample(df1m, 5)
-    if df5.empty or len(df5) < SWING_LKB_5M + 5:
-        return None
-
-    if side == "BUY":
-        sl = min(entry - 1e-6, swing_low(df5, SWING_LKB_5M) - SPREAD_BUF)
-    else:
-        sl = max(entry + 1e-6, swing_high(df5, SWING_LKB_5M) + SPREAD_BUF)
-
-    risk = abs(entry - sl)
-    if risk < RISK_MIN or risk > RISK_MAX:
-        return None
-
-    # 3) TP ≈ 1.5R в рамках 0.015..0.040
-    if side == "BUY":
-        tp = entry + max(TP_MIN_ABS, min(TP_MAX_ABS, RR_TARGET * risk))
-    else:
-        tp = entry - max(TP_MIN_ABS, min(TP_MAX_ABS, RR_TARGET * risk))
-
-    rr = abs(tp - entry) / max(risk, 1e-9)
-    if abs(tp - entry) < TP_MIN_ABS:
-        return None
-
-    return {
-        "side": side, "entry": entry, "tp": tp, "sl": sl,
-        "rr": rr, "kind": f"IMP{chosen_look}m",
-    }
-
-def fmt_signal(s: dict) -> str:
-    side = s["side"]
+def format_signal(setup: dict) -> str:
+    rr = setup.get("rr",0.0)
     return (
-        f"🔥 {side} NATGAS (NG=F) | {TF}\n"
-        f"✅ TP: **{rnd(s['tp'])}**\n"
-        f"🟥 SL: **{rnd(s['sl'])}**\n"
-        f"Entry: {rnd(s['entry'])}  RR≈{round(s['rr'],2)}  "
-        f"Buf≈{SPREAD_BUF}  {s['kind']}"
+        f"🔥 {setup['side']} NATGAS (NG=F) | 1m {setup['kind']}\n"
+        f"✅ TP: **{fmt(setup['tp'])}**\n"
+        f"🟥 SL: **{fmt(setup['sl'])}**\n"
+        f"Entry: {fmt(setup['entry'])}  Spread≈{fmt(SPREAD_BUF)}  RR≈{rr:.2f}"
     )
 
-# ================== ENGINE ==================
-async def engine_loop():
+def build_setup_impulse(df1m: pd.DataFrame) -> dict|None:
+    if df1m.empty or len(df1m) < max(IMP_LOOK_MIN,20)+3: return None
+    # импульс за окно
+    c_now = float(df1m["Close"].iloc[-1])
+    c_was = float(df1m["Close"].iloc[-(IMP_LOOK_MIN+1)])
+    delta = c_now - c_was
+    if abs(delta) < IMP_MOVE_MIN: return None
+
+    # последняя свеча должна быть "реальной"
+    i = len(df1m)-1
+    body = abs(df1m["Close"].iloc[i] - df1m["Open"].iloc[i])
+    if body < BODY_MIN: return None
+
+    side = "BUY" if delta>0 else "SELL"
+
+    # SL за свинг 5m
+    df5 = resample(df1m, 5)
+    entry = c_now + CFG.get("broker_offset",0.0)
+    if side=="BUY":
+        sl = min(entry-1e-6, swing_low(df5, 20) - SPREAD_BUF)
+        risk = max(SL_MIN, entry - sl)
+        tp  = min(entry + max(TP_MIN, RR_TARGET*risk), entry + TP_MAX)
+    else:
+        sl = max(entry+1e-6, swing_high(df5, 20) + SPREAD_BUF)
+        risk = max(SL_MIN, sl - entry)
+        tp  = max(entry - max(TP_MIN, RR_TARGET*risk), entry - TP_MAX)
+
+    rr = abs(tp-entry)/max(abs(entry-sl),1e-9)
+    return {"kind":"(Impulse)", "side":side, "entry":entry, "tp":tp, "sl":sl, "rr":rr}
+
+def build_setup_trend(df1m: pd.DataFrame) -> dict|None:
+    if df1m.empty or len(df1m) < 40: return None
+    df5 = resample(df1m,5)
+    if df5.empty or len(df5)<25: return None
+
+    # простая тенденция: close выше/ниже SMA20 на 5m и 10m-дельта того же знака
+    sma = df5["Close"].rolling(20).mean().iloc[-2]
+    c5  = float(df5["Close"].iloc[-2])
+    c10 = float(df1m["Close"].iloc[-11])
+    c1  = float(df1m["Close"].iloc[-1])
+    bias_up = (c5 > sma) and (c1 - c10 > 0.0)
+    bias_dn = (c5 < sma) and (c1 - c10 < 0.0)
+    if not (bias_up or bias_dn): return None
+
+    side = "BUY" if bias_up else "SELL"
+    entry = c1 + CFG.get("broker_offset",0.0)
+
+    if side=="BUY":
+        sl = min(entry-1e-6, swing_low(df5, 15) - SPREAD_BUF)
+        risk = max(SL_MIN, entry-sl)
+        tp  = min(entry + max(TP_MIN, RR_TARGET*risk), entry + TP_MAX)
+    else:
+        sl = max(entry+1e-6, swing_high(df5,15) + SPREAD_BUF)
+        risk = max(SL_MIN, sl-entry)
+        tp  = max(entry - max(TP_MIN, RR_TARGET*risk), entry - TP_MAX)
+
+    rr = abs(tp-entry)/max(abs(entry-sl),1e-9)
+    return {"kind":"(Trend)", "side":side, "entry":entry, "tp":tp, "sl":sl, "rr":rr}
+
+def build_setup_assist(df1m: pd.DataFrame) -> dict|None:
+    if df1m.empty or len(df1m)<25: return None
+    if atr1m(df1m,14) < ATR1_MIN_ASSIST: return None
+    # простое «вблизи пробоя» по 1m
+    i = len(df1m)-1
+    H = float(df1m["High"].iloc[i]); L = float(df1m["Low"].iloc[i])
+    O = float(df1m["Open"].iloc[i]); C = float(df1m["Close"].iloc[i])
+    entry = C + CFG.get("broker_offset",0.0)
+
+    if (H - C) <= (SPREAD_BUF*1.5) and C >= O:   # возле хая, зелёная
+        side = "BUY"
+        sl = min(entry-1e-6, entry - max(SL_MIN, 0.010))
+        tp = entry + max(TP_MIN, min(TP_MAX, 0.020 + SPREAD_BUF))
+    elif (C - L) <= (SPREAD_BUF*1.5) and C <= O: # возле лоу, красная
+        side = "SELL"
+        sl = max(entry+1e-6, entry + max(SL_MIN, 0.010))
+        tp = entry - max(TP_MIN, min(TP_MAX, 0.020 + SPREAD_BUF))
+    else:
+        return None
+
+    rr = abs(tp-entry)/max(abs(entry-sl),1e-9)
+    return {"kind":"(Assist)", "side":side, "entry":entry, "tp":tp, "sl":sl, "rr":rr}
+
+# ------------- ENGINE -------------
+async def engine():
+    await say(f"✅ Стартую: {VERSION}\n"
+              f"Лимит сегодня: {CFG.get('day_limit',DAY_LIMIT_DEFAULT)}  | Турбо: {'ON' if CFG.get('turbo',True) else 'OFF'}")
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                reset_if_new_day()
-
-                if time.time() < state["cooldown_until"]:
-                    await asyncio.sleep(POLL_SEC); continue
+                reset_day_if_needed()
+                # кулдаун между сигналами
+                if time.time() - float(CFG.get("last_signal_ts",0)) < COOLDOWN_MIN:
+                    await asyncio.sleep(2); continue
+                if CFG.get("signals_today",0) >= CFG.get("day_limit",DAY_LIMIT_DEFAULT):
+                    await asyncio.sleep(5); continue
 
                 df = await get_df(session)
-                if df.empty or len(df) < 80:
-                    await asyncio.sleep(POLL_SEC); continue
+                if df.empty or len(df)<40:
+                    await asyncio.sleep(1.2); continue
 
-                # закрылась новая свеча?
-                state["last_close_ts"] = time.time()
+                setup = None
+                # 1) Импульс
+                if CFG.get("turbo",True):
+                    setup = build_setup_impulse(df)
+                # 2) Тренд
+                if setup is None:
+                    setup = build_setup_trend(df)
+                # 3) Ассист
+                if setup is None and CFG.get("turbo",True):
+                    setup = build_setup_assist(df)
 
-                # лимит на день / пауза между сигналами
-                if state["signals_today"] >= DAILY_MAX_SIGNALS:
-                    await asyncio.sleep(POLL_SEC); continue
-                if (time.time() - (state["last_signal_ts"] or 0)) < MIN_GAP_MIN*60:
-                    await asyncio.sleep(POLL_SEC); continue
+                if setup:
+                    CFG["signals_today"] = int(CFG.get("signals_today",0)) + 1
+                    CFG["last_signal_ts"] = time.time()
+                    save_config(CFG)
+                    await say(format_signal(setup))
 
-                sig = build_signal(df)
-                if not sig:
-                    await asyncio.sleep(POLL_SEC); continue
+                await asyncio.sleep(0.6 if CFG.get("turbo",True) else 1.0)
 
-                # отправляем
-                await say(fmt_signal(sig))
-                state["signals_today"] += 1
-                state["last_signal_ts"] = time.time()
-                state["cooldown_until"] = time.time() + 2.0  # небольшой кулдаун от дублей
-
-                await asyncio.sleep(POLL_SEC)
             except Exception as e:
-                logging.error(f"engine error: {e}")
-                await asyncio.sleep(1.2)
+                logging.exception(e)
+                await asyncio.sleep(2.0)
 
-async def alive_loop():
-    while True:
-        try:
-            msg = (f"[ALIVE] {VERSION}\n"
-                   f"signals_today: {state['signals_today']}/{DAILY_MAX_SIGNALS}  "
-                   f"cooldown_left={max(0,int(state['cooldown_until']-time.time()))}s  "
-                   f"OFFSET={OFFSET:+.4f}")
-            await say(msg)
-        except Exception as e:
-            logging.error(f"alive error: {e}")
-        await asyncio.sleep(ALIVE_EVERY_SEC)
+# ------------- COMMANDS -------------
+@router.message(Command("start"))
+async def cmd_start(m: Message):
+    await m.answer(f"✅ Бот жив. {VERSION}\n"
+                   "Команды: статус | газ | лимит 5 | турбо вкл/выкл | /ref 4.040 | тест")
 
-# ================== MAIN ==================
+@router.message(F.text.lower().in_({"статус","status"}))
+async def cmd_status(m: Message):
+    reset_day_if_needed()
+    await m.answer(
+        "```\n"
+        f"mode: NG (Impulse)\n"
+        f"turbo: {'ON' if CFG.get('turbo',True) else 'OFF'}\n"
+        f"day: {CFG.get('day')}  signals: {CFG.get('signals_today',0)}/{CFG.get('day_limit',DAY_LIMIT_DEFAULT)}\n"
+        f"cooldown_left: {max(0,int(COOLDOWN_MIN - (time.time()-float(CFG.get('last_signal_ts',0))))) }s\n"
+        f"broker_offset: {CFG.get('broker_offset',0.0):.4f}\n"
+        "```"
+    )
+
+@router.message(F.text.lower().in_({"газ","ng","натгаз"}))
+async def cmd_ng(m: Message):
+    await m.answer("✅ Режим: NATGAS (NG=F) — активен.")
+
+@router.message(F.text.lower().regexp(r"^(лимит|limit)\s+(\d+)$"))
+async def cmd_limit(m: Message):
+    try:
+        n = int(m.text.split()[-1]); n = max(1, min(20, n))
+        CFG["day_limit"] = n; save_config(CFG)
+        await m.answer(f"✅ Лимит сигналов на сегодня: {n}")
+    except:
+        await m.answer("Формат: лимит 5")
+
+@router.message(F.text.lower().in_({"турбо вкл","turbo on"}))
+async def turbo_on(m: Message):
+    CFG["turbo"] = True; save_config(CFG)
+    await m.answer("⚡ Турбо: ON")
+
+@router.message(F.text.lower().in_({"турбо выкл","turbo off"}))
+async def turbo_off(m: Message):
+    CFG["turbo"] = False; save_config(CFG)
+    await m.answer("⛔ Турбо: OFF")
+
+@router.message(F.text.lower().regexp(r"^(/?ref|реф|смещение)\s+([0-9\.,]+)$"))
+async def cmd_ref(m: Message):
+    try:
+        # пользователь присылает цену с платформы, мы считаем offset = broker - yahoo
+        val = m.text.split()[-1].replace(",",".")
+        broker_px = float(val)
+        async with aiohttp.ClientSession() as s:
+            df = await get_df(s)
+        if df.empty: return await m.answer("Не получил цену с Yahoo. Попробуй позже.")
+        yahoo_px = float(df["Close"].iloc[-1])
+        CFG["broker_offset"] = broker_px - yahoo_px
+        save_config(CFG)
+        await m.answer(f"✅ Смещение сохранено: {CFG['broker_offset']:+.4f} (broker {broker_px:.4f} vs yahoo {yahoo_px:.4f})")
+    except Exception as e:
+        await m.answer(f"Не смог разобрать число. Пример: /ref 4.040")
+
+@router.message(F.text.lower().in_({"тест","/test"}))
+async def cmd_test(m: Message):
+    sample = {"kind":"(Test)", "side":"BUY", "entry":4.0000, "tp":4.0200, "sl":3.9880, "rr":1.67}
+    await m.answer(format_signal(sample))
+
+# ------------- MAIN -------------
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    asyncio.create_task(engine_loop())
-    asyncio.create_task(alive_loop())
+    asyncio.create_task(engine())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

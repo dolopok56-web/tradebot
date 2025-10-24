@@ -32,7 +32,7 @@ RR_DEFAULT = 1.5         # RR если считаем SL от TP (ниже ут�
 # Переменные среды (обязательно задать)
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
 OWNER_ID = int(os.getenv("OWNER_ID", "6784470762") or 0)
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or 0)
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "6784470762") or 0)
 
 # =================================================
 
@@ -349,3 +349,4 @@ async def on_startup(_):
 if __name__ == "__main__":
     # ВАЖНО: НИКАКИХ asyncio.run(...) !
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+

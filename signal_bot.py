@@ -1,203 +1,316 @@
-sudo systemctl stop signaler.service || true
-mkdir -p /root/tradebot
-cat > /root/tradebot/signal_bot.py <<'PY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, asyncio, time, json, logging, aiohttp, math
+# =================== XAU M1 SIGNAL BOT (LOUD) ===================
+# Частые сигналы по золоту XAU (GC=F / XAUUSD=X, 1m Yahoo)
+# Без ATR/ RR/ мудрёных фильтров. Простая логика:
+# - работа по закрытой свече М1
+# - свеча не должна быть "пылью": диапазон >= MIN_RANGE_PIPS и тело >= MIN_BODY_PIPS
+# - направление: BREAKOUT (закрытие у экстремума свечи) или PULLBACK по короткому наклону
+# - TP динамический: max(свеча*коэф, TP_MIN_PIPS), но не выше TP_CAP_PIPS
+# - SL короткий за хвост/локальный экстремум
+# - анти-спам: не повторяем тот же сайд два раза подряд на одной и той же цене
+
+import os
+import time
+import math
+import asyncio
+import logging
 from datetime import datetime, timezone
+
+import aiohttp
+import pandas as pd
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
 from aiogram.filters import Command
 
-# ================== НАСТРОЙКИ ==================
+# =================== SETTINGS ===================
+
+VERSION = "XAU-M1 Loud v1.0"
+
+# Токены/чаты (можно переопределить через ENV)
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
-LOG_BOT_TOKEN  = os.getenv("LOG_BOT_TOKEN",  MAIN_BOT_TOKEN)  # можно одним ботом
 OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
 
-# только золото
-NAME     = "GOLD"
-Y_SYMS   = ("GC=F","XAUUSD=X")  # фьюч и спот (бэкап)
-POLL_SEC = 0.35
+# Символы и фиды
+SYMBOL  = "XAU"                    # логическое имя
+NAME    = "GOLD (XAU)"             # подпись в сообщениях
+TICKERS = ["GC=F", "XAUUSD=X"]     # порядок опроса на Yahoo, берём первый, где есть данные
 
-# анти-«молчун»: простые пороги для M1
-MIN_RANGE_PIPS = 3.0   # свеча должна иметь диапазон >= 3 пунктов
-MIN_BODY_PIPS  = 1.0   # тело >= 1 пункт
-COOLDOWN_BARS  = 2     # минимум 2 закрытых бара между сигналами
-DAY_LIMIT      = 20    # макс сигналов в сутки
+# Частота и режим
+POLL_SEC        = 0.30             # опрос ленты
+PER_BAR_MODE    = True             # работать по закрытию каждой М1, если свеча нормальная
+COOLDOWN_BARS   = 0                # 0 = можно каждый бар; 2 = раз в ~3 минуты
+MAX_SIGNALS_DAY = 50               # страховка на день
 
-# рамки для целей
-TP_MIN = 4.0
-TP_MAX = 30.0
-SL_MIN = 6.0
-SL_MAX = 12.0
+# Порог «не пыль»
+MIN_RANGE_PIPS  = 3.0              # минимальный High-Low у свечи, чтобы говорить
+MIN_BODY_PIPS   = 1.0              # минимальное тело |Close-Open|
 
-# ================== ТГ ==================
-router = Router()
-bot_main = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
-bot_log  = Bot(LOG_BOT_TOKEN,  default=DefaultBotProperties(parse_mode=None))
-dp = Dispatcher(); dp.include_router(router)
+# TP/SL
+TP_MIN_PIPS     = 4.0              # минимум, как просил
+TP_CAP_PIPS     = 30.0             # не ставим космос
+TP_COEF         = 1.4              # TP = max(range*коэф, TP_MIN), но ≤ TP_CAP
+SL_TAIL_PAD     = 0.8              # SL за тенью на ~0.8 пункта
+SL_MIN_PIPS     = 5.0              # нижняя планка для SL (чуть шире, чтобы не сдувало)
+SL_MAX_PIPS     = 18.0             # верхняя (страховка)
 
-async def send(text:str):
+# Мелочи
+HTTP_TIMEOUT    = 12
+ROBUST_HEADERS  = {"User-Agent": "Mozilla/5.0"}
+LOG_EVERY_SEC   = 300
+
+# =================== TELEGRAM ===================
+
+router    = Router()
+bot_main  = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
+dp        = Dispatcher()
+dp.include_router(router)
+
+async def send(text: str):
     try:
         await bot_main.send_message(TARGET_CHAT_ID, text)
     except Exception as e:
         logging.error(f"send error: {e}")
 
-# ================== ПРАЙСЫ (Yahoo) ==================
-ROBUST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    "Accept": "*/*",
-}
+@router.message(Command("start"))
+async def cmd_start(m: Message):
+    await m.answer(f"✅ {VERSION}\nРежим: {NAME} M1.\nНапиши: статус / золото")
 
-async def y_json(session: aiohttp.ClientSession, url: str) -> dict:
-    backoff = 0.9
-    for _ in range(4):
-        try:
-            async with session.get(url, headers=ROBUST_HEADERS, timeout=12) as r:
-                if r.status == 200:
-                    return await r.json(content_type=None)
-                if r.status in (429,503):
-                    await asyncio.sleep(backoff); backoff *= 1.6; continue
-                return {}
-        except:
-            await asyncio.sleep(backoff); backoff *= 1.6
+@router.message(F.text.casefold() == "золото")
+async def cmd_gold(m: Message):
+    await m.answer("✅ Режим уже: GOLD (XAU) M1.")
+
+@router.message(F.text.casefold() == "статус")
+async def cmd_status(m: Message):
+    s = state
+    lines = [
+        f"mode: XAU (requested: XAU)",
+        f"alive: OK | poll={POLL_SEC}s",
+        f"cooldown_bars={COOLDOWN_BARS} last_close_age={int(time.time()-s.get('last_close_ts',0))}s",
+        f"signals_today={s.get('signals_today',0)} (limit={MAX_SIGNALS_DAY})",
+        f"last_side={s.get('last_side','-')} last_price={s.get('last_price','-')}",
+        f"tp_min={TP_MIN_PIPS} cap={TP_CAP_PIPS} min_range={MIN_RANGE_PIPS} min_body={MIN_BODY_PIPS}",
+    ]
+    await m.answer("`\n" + "\n".join(lines) + "\n`")
+
+# =================== PRICE FEED ===================
+
+_prices_cache = {"df": None, "ts": 0.0, "src": ""}
+
+async def yahoo_json(session: aiohttp.ClientSession, url: str) -> dict:
+    try:
+        async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
+            if r.status == 200:
+                return await r.json(content_type=None)
+    except:
+        pass
     return {}
 
-async def get_m1(session: aiohttp.ClientSession):
-    """Вернёт OHLC списками по закрытым барам (макс 2000), либо None."""
-    for sym in Y_SYMS:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=5d"
-        p = await y_json(session, url)
-        try:
-            r = p["chart"]["result"][0]
-            ts = r["timestamp"]; q = r["indicators"]["quote"][0]
-            o, h, l, c = q["open"], q["high"], q["low"], q["close"]
-            # чистим None и нули, берём последние 2000
-            o2=h2=l2=c2=[]; idx=[]
-            for i in range(len(c)):
-                if all(v is not None and v>0 for v in (o[i],h[i],l[i],c[i])):
-                    idx.append(ts[i]); o2.append(o[i]); h2.append(h[i]); l2.append(l[i]); c2.append(c[i])
-            if len(c2) > 5:
-                return {"t": idx[-2000:], "o": o2[-2000:], "h": h2[-2000:], "l": l2[-2000:], "c": c2[-2000:]}
-        except Exception:
-            pass
-    return None
+def df_from_yahoo(payload: dict) -> pd.DataFrame:
+    try:
+        r = payload.get("chart", {}).get("result", [])[0]
+        ts = r.get("timestamp", [])
+        q  = r.get("indicators", {}).get("quote", [])[0]
+        if not ts or not q:
+            return pd.DataFrame()
+        df = pd.DataFrame({
+            "Open":  q.get("open",  []),
+            "High":  q.get("high",  []),
+            "Low":   q.get("low",   []),
+            "Close": q.get("close", []),
+        }, index=pd.to_datetime(ts, unit="s"))
+        df = df.ffill().bfill().dropna()
+        for c in ("Open","High","Low","Close"):
+            df = df[df[c] > 0]
+        return df.tail(2000).reset_index(drop=True)
+    except:
+        return pd.DataFrame()
 
-# ================== ЛОГИКА СИГНАЛОВ ==================
+async def get_df(session: aiohttp.ClientSession) -> pd.DataFrame:
+    now = time.time()
+    if _prices_cache["df"] is not None and now - _prices_cache["ts"] < 0.5:
+        return _prices_cache["df"]
+
+    # пробуем тики по тикерам по очереди
+    for t in TICKERS:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=2d"
+        df = df_from_yahoo(await yahoo_json(session, url))
+        if not df.empty:
+            _prices_cache.update({"df": df, "ts": now, "src": t})
+            return df
+    return pd.DataFrame()
+
+# =================== LOGIC ===================
+
 state = {
-    "last_closed_idx": -1,
-    "last_signal_idx": -9999,
+    "last_bar_idx": -1,
+    "last_close_ts": 0.0,
+    "last_signal_bar": -999,
+    "last_side": None,
+    "last_price": None,
+    "signals_today": 0,
     "day": None,
-    "count": 0,
 }
 
-def new_day():
-    d = datetime.now(timezone.utc).date().isoformat()
+def reset_day_if_needed():
+    d = datetime.utcnow().date().isoformat()
     if state["day"] != d:
-        state["day"] = d; state["count"] = 0
+        state["day"] = d
+        state["signals_today"] = 0
 
-def pips(a,b):  # в твоём терминале 1 пункт = 1.00 цены
-    return abs(float(a)-float(b))
+def pips(x: float) -> float:
+    return float(x)
 
-def make_setup(o,h,l,c):
-    """Возвращает dict сигнала или None. Очень простой импульс."""
-    rng  = pips(h,l)
-    body = pips(o,c)
+def fmt(x: float) -> str:
+    return f"{x:.2f}"
+
+def candle_signal(o: float, h: float, l: float, c: float, prev_closes: list) -> dict|None:
+    rng  = h - l
+    body = abs(c - o)
     if rng < MIN_RANGE_PIPS or body < MIN_BODY_PIPS:
         return None
 
-    side = "BUY" if c>o else "SELL"
-    entry = c  # вход по цене закрытия бара
+    # breakout, если закрытие рядом с экстремумом свечи
+    near_top = (h - c) <= 0.6
+    near_bot = (c - l) <= 0.6
 
-    # динамический TP/SL из «силы» свечи, но в границах
-    base = max(MIN_RANGE_PIPS, min(12.0, rng))  # ограничим влияние
-    tp_size = max(TP_MIN, min(TP_MAX, base*2.2))  # 4..30
-    sl_size = max(SL_MIN, min(SL_MAX, base*1.2))  # 6..12
+    # простой наклон: последние 8 закрытий
+    slope = 0.0
+    if len(prev_closes) >= 8:
+        slope = prev_closes[-1] - prev_closes[-8]
+
+    side = None
+    reason = ""
+    if near_top or slope > 0:
+        side = "BUY"; reason = "BREAKOUT" if near_top else "PULLBACK-UP"
+    if near_bot or slope < 0:
+        # если оба сработали — берём что ближе к экстремуму
+        if side is None:
+            side = "SELL"; reason = "BREAKOUT" if near_bot else "PULLBACK-DOWN"
+        else:
+            # выбрать более очевидный: сравним расстояние до экстремума
+            dist_top = h - c
+            dist_bot = c - l
+            if dist_bot < dist_top:
+                side = "SELL"; reason = "BREAKOUT" if near_bot else "PULLBACK-DOWN"
+
+    if side is None:
+        return None
+
+    # entry — закрытие бара
+    entry = c
+
+    # TP динамический
+    raw_tp = max(rng * TP_COEF, TP_MIN_PIPS)
+    raw_tp = min(raw_tp, TP_CAP_PIPS)
 
     if side == "BUY":
-        tp = entry + tp_size
-        sl = entry - sl_size
+        tp = entry + raw_tp
+        # SL — за тенью или минимумом бара
+        sl = min(entry - SL_MIN_PIPS, l - SL_TAIL_PAD)
+        sl = max(entry - SL_MAX_PIPS, sl)  # ограничить глубину
     else:
-        tp = entry - tp_size
-        sl = entry + sl_size
+        tp = entry - raw_tp
+        sl = max(entry + SL_MIN_PIPS, h + SL_TAIL_PAD)
+        sl = min(entry + SL_MAX_PIPS, sl)
 
-    rr = (tp_size / max(sl_size,1e-9))
+    if abs(tp - entry) < TP_MIN_PIPS:
+        return None
+
     return {
-        "side": side, "entry": entry, "tp": tp, "sl": sl,
-        "tp_size": tp_size, "sl_size": sl_size, "rr": rr
+        "side": side,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "rng": rng,
+        "body": body,
+        "reason": reason,
     }
 
-def fmt(s):
-    return (f"🔥 {NAME} {s['side']}\n"
-            f"Entry: {s['entry']:.2f}\n"
-            f"TP: **{s['tp']:.2f}** (+{s['tp_size']:.1f} пп)\n"
-            f"SL: **{s['sl']:.2f}** (-{s['sl_size']:.1f} пп)\n"
-            f"RR≈{s['rr']:.2f}")
+def text_signal(sig: dict) -> str:
+    side = "BUY" if sig["side"] == "BUY" else "SELL"
+    rr   = abs(sig["tp"] - sig["entry"]) / max(abs(sig["entry"] - sig["sl"]), 1e-9)
+    return (
+        f"🔥 {side} {NAME} | M1 ({sig['reason']})\n"
+        f"Entry: {fmt(sig['entry'])}\n"
+        f"✅ TP: **{fmt(sig['tp'])}**\n"
+        f"🟥 SL: **{fmt(sig['sl'])}**\n"
+        f"rng={fmt(sig['rng'])} body={fmt(sig['body'])}  RR≈{rr:.2f}"
+    )
 
-# ================== БОЕВОЙ ЦИКЛ ==================
-async def engine():
-    await send(f"✅ {NAME} bot online. Порог: body≥{MIN_BODY_PIPS} / range≥{MIN_RANGE_PIPS}, "
-               f"cooldown={COOLDOWN_BARS}b, day_limit={DAY_LIMIT}.")
-    async with aiohttp.ClientSession() as sess:
+# =================== ENGINE ===================
+
+async def engine_loop():
+    last_log = 0.0
+    async with aiohttp.ClientSession() as session:
         while True:
             try:
-                d = await get_m1(sess)
-                if not d:
-                    await asyncio.sleep(POLL_SEC); continue
+                reset_day_if_needed()
+                if state["signals_today"] >= MAX_SIGNALS_DAY:
+                    if time.time() - last_log > 60:
+                        await send("⚠️ Дневной лимит сигналов достигнут.")
+                        last_log = time.time()
+                    await asyncio.sleep(POLL_SEC)
+                    continue
 
-                new_day()
-                i_last = len(d["c"]) - 1          # индекс текущего формирующегося
-                i_closed = i_last - 1             # последний закрытый
+                df = await get_df(session)
+                if df.empty or len(df) < 20:
+                    await asyncio.sleep(POLL_SEC)
+                    continue
 
-                # чтобы не дублить
-                if i_closed <= state["last_closed_idx"]:
-                    await asyncio.sleep(POLL_SEC); continue
-                state["last_closed_idx"] = i_closed
+                i = len(df) - 1         # текущий бар формируется
+                cbar = i - 1            # закрытый бар
+                if cbar <= state["last_bar_idx"]:
+                    await asyncio.sleep(POLL_SEC)
+                    continue
 
-                # кулдаун по барам
-                if (i_closed - state["last_signal_idx"]) < COOLDOWN_BARS:
-                    await asyncio.sleep(POLL_SEC); continue
+                o = float(df["Open"].iloc[cbar])
+                h = float(df["High"].iloc[cbar])
+                l = float(df["Low"].iloc[cbar])
+                c = float(df["Close"].iloc[cbar])
+                prev_closes = df["Close"].iloc[max(0, cbar-50):cbar].tolist()
 
-                if state["count"] >= DAY_LIMIT:
-                    await asyncio.sleep(POLL_SEC); continue
+                state["last_bar_idx"] = cbar
+                state["last_close_ts"] = time.time()
 
-                # берём закрытый бар
-                o = d["o"][i_closed]; h = d["h"][i_closed]
-                l = d["l"][i_closed]; c = d["c"][i_closed]
+                # анти-спам по барам
+                if COOLDOWN_BARS > 0 and (cbar - state["last_signal_bar"] < COOLDOWN_BARS):
+                    continue
 
-                setup = make_setup(o,h,l,c)
-                if setup:
-                    await send(fmt(setup))
-                    state["last_signal_idx"] = i_closed
-                    state["count"] += 1
+                sig = candle_signal(o, h, l, c, prev_closes)
+                if not sig:
+                    # периодический "жив"
+                    if time.time() - last_log > LOG_EVERY_SEC:
+                        await send(f"[ALIVE] feed={_prices_cache['src']} last={fmt(c)} OK")
+                        last_log = time.time()
+                    continue
+
+                # не дублировать тот же сайд на почти той же цене
+                if state["last_side"] == sig["side"] and state["last_price"] is not None:
+                    if abs(sig["entry"] - state["last_price"]) <= 1.0:
+                        continue
+
+                # отправка сигнала
+                await send(text_signal(sig))
+
+                # обновить состояние
+                state["last_signal_bar"] = cbar
+                state["signals_today"]  += 1
+                state["last_side"]       = sig["side"]
+                state["last_price"]      = sig["entry"]
 
             except Exception as e:
-                logging.exception(f"engine error: {e}")
-                await asyncio.sleep(1.5)
+                logging.error(f"engine error: {e}")
+                await asyncio.sleep(1.0)
             await asyncio.sleep(POLL_SEC)
 
-# ================== КОМАНДЫ ==================
-@router.message(Command("start"))
-async def start(m: Message):
-    await m.answer(f"✅ {NAME} bot готов. /status — проверить.")
-
-@router.message(F.text.lower() == "статус")
-@router.message(F.text.lower() == "status")
-async def st(m: Message):
-    await m.answer("`\n"
-                   f"mode: {NAME}\n"
-                   f"poll={POLL_SEC}s cooldown_bars={COOLDOWN_BARS}\n"
-                   f"min_range={MIN_RANGE_PIPS} min_body={MIN_BODY_PIPS}\n"
-                   f"signals_today={state['count']} (limit={DAY_LIMIT})\n"
-                   "`")
-
-# ================== MAIN ==================
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    asyncio.create_task(engine())
+    asyncio.create_task(engine_loop())
     await dp.start_polling(bot_main)
 
 if __name__ == "__main__":
@@ -205,29 +318,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-PY
-
-# Проверка синтаксиса
-python3 -m py_compile /root/tradebot/signal_bot.py || { echo "Syntax error"; exit 1; }
-
-# Обновим/создадим unit (если у тебя уже есть, просто убедись в пути ExecStart)
-cat | sudo tee /etc/systemd/system/signaler.service >/dev/null <<'UNIT'
-[Unit]
-Description=Signal Bot
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /root/tradebot/signal_bot.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-sudo systemctl daemon-reload
-sudo systemctl start signaler.service
-sudo systemctl enable signaler.service
-sleep 1
-journalctl -u signaler.service -n 30 --no-pager

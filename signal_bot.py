@@ -247,11 +247,12 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
     if time.time() < cooldown_until[symbol]: return
 
     # ===== STREAM: вход по текущей свече каждые N секунд =====
+        # ===== STREAM (динамические TP/SL по графику) =====
     if ENABLE_STREAM_MODE:
         now_ts = time.time()
         if ONLY_ACTIVE_HOURS:
             h = pd.Timestamp.utcnow().hour
-            if not ((7 <= h <= 14) or (12 <= h <= 20)):  # Лондон / НЙ (UTC)
+            if not ((7 <= h <= 14) or (12 <= h <= 20)):
                 return
         if now_ts - _last_stream_ts[symbol] < STREAM_COOLDOWN_SEC:
             return
@@ -263,19 +264,90 @@ async def handle_symbol(session: aiohttp.ClientSession, symbol: str):
         entry = float(df["Close"].iloc[i])
         buf   = SPREAD_BUFFER.get(symbol, 0.0)
 
+        # попробуем взять ближайший уровень из памяти (если он логичен)
+        mem_target = nearest_level_from_memory(symbol, side, entry)
+
+        # свинг 15m как опора для SL/TP
+        df15 = _resample(df, 15)
+        swing_ok = False
+        if not df15.empty:
+            if side == "BUY":
+                swing_lo = _swing_low(df15, 20)
+                swing_ok = True
+            else:
+                swing_hi = _swing_high(df15, 20)
+                swing_ok = True
+
+        # вычислим SL: по свингу если есть, иначе небольшая страховка
         if side == "BUY":
-            tp = entry + TP_STREAM_PIPS
-            sl = entry - SL_STREAM_PIPS
+            if swing_ok:
+                sl = min(entry - 1e-6, swing_lo - buf)
+                # не делаем стоп слишком близко
+                if entry - sl < 2.0:
+                    sl = entry - max(2.0, SL_STREAM_PIPS) 
+            else:
+                sl = entry - SL_STREAM_PIPS
         else:
-            tp = entry - TP_STREAM_PIPS
-            sl = entry + SL_STREAM_PIPS
+            if swing_ok:
+                sl = max(entry + 1e-6, swing_hi + buf)
+                if sl - entry < 2.0:
+                    sl = entry + max(2.0, SL_STREAM_PIPS)
+            else:
+                sl = entry + SL_STREAM_PIPS
+
+        # вычислим TP: предпочтение ближайшему уровню, иначе RR*случай/кап
+        tp_min = TP_MIN_ABS.get(symbol, 4.0)
+        tp_cap = MAX_TP_CAP if 'MAX_TP_CAP' in globals() else 30.0
+
+        cand_tps = []
+        # если есть уровень в нужном направлении и адекватен — используем
+        if mem_target is not None:
+            if side == "BUY" and mem_target > entry + 0.5:
+                cand_tps.append(min(mem_target, entry + tp_cap))
+            if side == "SELL" and mem_target < entry - 0.5:
+                cand_tps.append(max(mem_target, entry - tp_cap))
+
+        # базовый TP по соотношению RR ≈ 1.25
+        risk = abs(entry - sl)
+        if risk <= 0:
+            base_rr = tp_min
+        else:
+            base_rr = entry + (1.25 * risk) if side == "BUY" else entry - (1.25 * risk)
+            # ограничим в разумных пределах
+            if side == "BUY":
+                base_rr = min(base_rr, entry + tp_cap)
+            else:
+                base_rr = max(base_rr, entry - tp_cap)
+        cand_tps.append(base_rr)
+
+        # ещё можно учесть локальный диапазон (5m) для усиления цели
+        df5 = _resample(df, 5)
+        if not df5.empty:
+            h5 = float(df5["High"].tail(6).max()); l5 = float(df5["Low"].tail(6).min())
+            rng5 = max(0.0, h5 - l5)
+            vol_tp = entry + (0.5 * rng5) if side == "BUY" else entry - (0.5 * rng5)
+            cand_tps.append(vol_tp)
+
+        # финальный TP: выбираем наиболее консервативный/адекватный вариант
+        if side == "BUY":
+            tp = max([x for x in cand_tps if x>entry], default=entry+tp_min)
+            tp = min(tp, entry + tp_cap)
+            tp = max(tp, entry + tp_min)
+        else:
+            tp = min([x for x in cand_tps if x<entry], default=entry-tp_min)
+            tp = max(tp, entry - tp_cap)
+            tp = min(tp, entry - tp_min)
+
+        # safety: приводим tp/sl к 2 знакам
+        tp = round(float(tp), 2)
+        sl = round(float(sl), 2)
 
         setup = {
             "symbol": symbol, "tf": "1m", "side": side,
             "trend": "UP" if side == "BUY" else "DOWN",
             "entry": entry, "tp": tp, "sl": sl,
-            "tp_abs": abs(tp-entry), "tp_min": TP_MIN_ABS.get(symbol, 4.0),
-            "kind": "STREAM"
+            "tp_abs": abs(tp-entry), "tp_min": tp_min,
+            "kind": "STREAM_DYNAMIC"
         }
 
         await send_main("🧠 IDEA:\n" + format_signal(setup, buf))
@@ -320,3 +392,4 @@ async def main():
 if __name__=="__main__":
     try: asyncio.run(main())
     except (KeyboardInterrupt, SystemExit): pass
+

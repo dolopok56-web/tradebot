@@ -1,255 +1,351 @@
-#!/usr/bin/env python3
+# signal_bot.py
 # -*- coding: utf-8 -*-
 
 import os
-import asyncio
+import time
 import logging
-from dataclasses import dataclass
-from time import time
+import asyncio
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import yfinance as yf
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import start_polling
+from aiogram.utils import executor
+from aiogram.dispatcher.filters import BoundFilter
 
-# ----------------------- ЛОГИ -----------------------
+# ==================== CONFIG ====================
+
+SYMBOL = "GC=F"          # GOLD futures у Yahoo
+TF = "1m"                # M1
+PIP = 0.1                # 1 "пип" для золота = 0.1
+POLL_SEC = 0.3           # частота опроса фида
+HISTORY_BARS = 120       # сколько свеч берём из истории
+
+# Фильтры свечей (чтобы не брать «пыль»)
+MIN_RANGE_PIPS = 3.0     # min High-Low в пипсах
+MIN_BODY_PIPS = 1.0      # min |Close-Open| в пипсах
+TP_MIN_PIPS = 4.0        # минимум ТР
+TP_CAP_PIPS = 30.0       # максимум ТР (ограничитель)
+RR_DEFAULT = 1.5         # RR если считаем SL от TP (ниже уточняем)
+
+# Переменные среды (обязательно задать)
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
+OWNER_ID = int(os.getenv("OWNER_ID", "6784470762") or 0)
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or 0)
+
+# =================================================
+
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger("xau-bot")
 
-# ----------------------- КОНФИГ -----------------------
-# Токен/чаты: читаем из ENV, но даём дефолты, чтобы работало сразу
-MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN") or "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "6784470762"))
-OWNER_ID       = int(os.getenv("OWNER_ID",       "6784470762"))
+if not MAIN_BOT_TOKEN or not TARGET_CHAT_ID or not OWNER_ID:
+    logging.error("Нет переменных среды MAIN_BOT_TOKEN / OWNER_ID / TARGET_CHAT_ID")
+    raise SystemExit(1)
 
-# Рынок
-SYMBOL_YF   = "XAUUSD=X"   # золото спот в Yahoo
-INTERVAL    = "1m"         # минутные свечи
-POLL_SEC    = 0.3          # тик цикла
-HIST_BARS   = 120          # сколько минутных баров подгружать
+bot = Bot(token=MAIN_BOT_TOKEN)
+dp = Dispatcher(bot)
 
-# Фильтры/ограничители
-SINGLE_TRADE_MODE = True   # только 1 сделка единовременно
-TP_MIN_PIPS       = 4.0    # минимум цели
-CAP_PIPS          = 30.0   # максимум цели (ограничитель)
-MIN_RANGE_PIPS    = 3.0    # минимальный размер свечи (high-low)
-MIN_BODY_PIPS     = 1.0    # минимальное тело
+# --- доступ только владельцу/цели ---
+class AllowedChat(BoundFilter):
+    key = "allowed"
 
-# Сигнальная логика (простая и отзывчивая)
-BREAK_BODY_PCT    = 0.6    # насколько полным должно быть тело (0..1)
-PULLBACK_TRIGGER  = 2.0    # мин. размер отката в пипсах, чтобы взять ретест
+    def __init__(self, allowed: bool):
+        self.allowed = allowed
 
-# ----------------------- ТЕЛЕГРАМ -----------------------
-bot = Bot(MAIN_BOT_TOKEN, parse_mode="HTML")
-dp  = Dispatcher(bot)
+    async def check(self, msg: types.Message) -> bool:
+        if msg.chat and msg.chat.id == TARGET_CHAT_ID:
+            return True
+        if msg.from_user and msg.from_user.id == OWNER_ID:
+            return True
+        return False
 
-def pips(a: float, b: float) -> float:
-    return abs(a - b)
+dp.filters_factory.bind(AllowedChat)
 
-@dataclass
-class Trade:
-    side: str         # "BUY"/"SELL"
-    entry: float
-    tp: float
-    sl: float
-    created_at: float
+# --- состояние движка и активной сделки ---
+class EngineState:
+    def __init__(self):
+        self.mode = "XAU"                 # один инструмент
+        self.last_bar_ts = None           # время последней закрытой свечи (UTC)
+        self.last_price = None
+        self.signals_today = 0
+        self.limit_per_day = 50
+        self.cooldown_bars = 0            # 0 = сигнал можно на каждую закрытую свечу
+        self.cooldown_left = 0
+        self.active_trade = None          # dict | None
+        self.poll_ok = True
+        self.last_fetch_ok = None
 
-active_trade: Trade | None = None
-last_close_ts: float = 0.0  # защита от двойной обработки одной и той же свечи
+    def reset_day_counters_if_new_day(self):
+        now_utc = datetime.now(timezone.utc)
+        # обнулим счётчики в 00:00 UTC
+        if self.last_bar_ts and now_utc.date() != self.last_bar_ts.date():
+            self.signals_today = 0
+            self.cooldown_left = 0
 
-# ----------------------- ДАННЫЕ -----------------------
-async def load_history():
+ES = EngineState()
+
+# ---------- Вспомогалки ----------
+
+def pips(value: float) -> float:
+    """сколько пипсов в абсолютном движении цены"""
+    return abs(value) / PIP
+
+def pips_to_price(pips_count: float) -> float:
+    return pips_count * PIP
+
+def fmt_price(x: float) -> str:
+    return f"{x:,.2f}".replace(",", " ")
+
+def load_m1_history(symbol: str, bars: int) -> pd.DataFrame:
     """
-    Грузим минутные свечи за сегодня с Yahoo. Возвращаем pd.DataFrame с колонками:
-    ['open','high','low','close'] и индексом datetime (UTC).
+    Берём историю M1. yfinance иногда отдаёт незакрытую последнюю минуту —
+    поэтому считаем закрытой предпоследнюю строку, если индекс совпадает с текущей минутой.
     """
-    loop = asyncio.get_event_loop()
-    df = await loop.run_in_executor(None, lambda: yf.download(
-        tickers=SYMBOL_YF,
-        interval=INTERVAL,
-        period="1d",
+    df = yf.download(
+        tickers=symbol,
+        period="2d",
+        interval="1m",
         progress=False,
-        auto_adjust=False,
-        threads=False
-    ))
-    if df is None or df.empty:
-        raise RuntimeError("Empty data from Yahoo")
-    df = df.rename(columns=str.lower)[["open", "high", "low", "close"]]
+        threads=False,
+    )
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("Empty history")
+
+    df = df.tail(bars + 3).copy()
+    # нормализуем индекс в UTC
+    df.index = df.index.tz_convert("UTC")
     return df
 
-# ----------------------- СИГНАЛЫ -----------------------
-def detect_signal(df: pd.DataFrame) -> tuple[str, float, float, float, str] | None:
+def last_closed_candle(df: pd.DataFrame):
+    """
+    Возвращает последнюю закрытую свечу (ts, o, h, l, c).
+    Если последняя строка == текущая незакрытая минута — берём предыдущую.
+    """
+    now_utc_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    ts = df.index[-1].to_pydatetime()
+    if ts >= now_utc_min:
+        # незакрытая — берём -2
+        ts = df.index[-2].to_pydatetime()
+        row = df.iloc[-2]
+    else:
+        row = df.iloc[-1]
+
+    return ts, float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
+
+def build_signal_from_candle(o, h, l, c):
     """
     Простая логика:
-      1) Breakout: большая свеча-тренд (полное тело), пробой тела в сторону
-      2) Pullback: откат >= PULLBACK_TRIGGER и возврат в сторону тренда
-    Возвращает (side, entry, tp, sl, reason) или None.
+    - если тело вниз и диапазон достаточный → SELL (Pullback-Down)
+    - если тело вверх и диапазон достаточный → BUY  (Pullback-Up)
+    Варианты BREAKOUT/PULLBACK только как метка — чисто косметика.
     """
-    if len(df) < 5:
+    rng_pips = pips(h - l)
+    body_pips = pips(c - o)
+
+    if rng_pips < MIN_RANGE_PIPS or abs(body_pips) < MIN_BODY_PIPS:
         return None
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    if c < o:
+        side = "SELL"
+        style = "PULLBACK-DOWN"
+        entry = c
+    else:
+        side = "BUY"
+        style = "PULLBACK-UP"
+        entry = c
 
-    rng = last["high"] - last["low"]
-    body = abs(last["close"] - last["open"])
+    # TP/SL:
+    # базовый TP — max(MIN, 0.9 * rng) но capped
+    base_tp = max(TP_MIN_PIPS, 0.9 * rng_pips)
+    tp_pips = min(base_tp, TP_CAP_PIPS)
 
-    if rng < MIN_RANGE_PIPS or body < MIN_BODY_PIPS:
-        return None
+    # SL под RR≈1.5 (минимум 0.6*TP чтобы не слишком узкий)
+    sl_pips = max(tp_pips / RR_DEFAULT, tp_pips * 0.6)
 
-    body_ok = (body / rng) >= BREAK_BODY_PCT
+    if side == "SELL":
+        tp = entry - pips_to_price(tp_pips)
+        sl = entry + pips_to_price(sl_pips)
+    else:
+        tp = entry + pips_to_price(tp_pips)
+        sl = entry - pips_to_price(sl_pips)
 
-    # Определяем направление (по телу)
-    direction_up   = last["close"] > last["open"]
-    direction_down = last["close"] < last["open"]
+    rr = tp_pips / sl_pips
 
-    entry = float(last["close"])
+    return {
+        "side": side,
+        "style": style,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "tp_pips": tp_pips,
+        "sl_pips": sl_pips,
+        "rng_pips": rng_pips,
+        "body_pips": abs(body_pips),
+        "opened_ts": None,       # заполним, когда «зафиксируем» сигнал
+        "bar_ts": None,          # штамп бара, на котором он родился
+        "active": True,
+    }
 
-    # --- Breakout ---
-    if body_ok:
-        if direction_up:
-            # TP/SL на CAP/2 по умолчанию
-            tp = min(entry + max(TP_MIN_PIPS, body), entry + CAP_PIPS)
-            sl = max(entry - max(MIN_BODY_PIPS, body/2), entry - CAP_PIPS)
-            if (tp - entry) >= TP_MIN_PIPS:
-                return ("BUY", entry, tp, sl, "BREAKOUT")
-        if direction_down:
-            tp = max(entry - max(TP_MIN_PIPS, body), entry - CAP_PIPS)
-            sl = min(entry + max(MIN_BODY_PIPS, body/2), entry + CAP_PIPS)
-            if (entry - tp) >= TP_MIN_PIPS:
-                return ("SELL", entry, tp, sl, "BREAKOUT")
-
-    # --- Pullback ---
-    # если текущая свеча вернулась внутрь тела предыдущей на PULLBACK_TRIGGER
-    prev_mid = (prev["open"] + prev["close"]) / 2
-    if direction_up and (prev_mid - last["open"] >= PULLBACK_TRIGGER):
-        tp = min(entry + max(TP_MIN_PIPS, rng), entry + CAP_PIPS)
-        sl = max(entry - max(MIN_BODY_PIPS, rng/2), entry - CAP_PIPS)
-        if (tp - entry) >= TP_MIN_PIPS:
-            return ("BUY", entry, tp, sl, "PULLBACK-UP")
-
-    if direction_down and (last["open"] - prev_mid >= PULLBACK_TRIGGER):
-        tp = max(entry - max(TP_MIN_PIPS, rng), entry - CAP_PIPS)
-        sl = min(entry + max(MIN_BODY_PIPS, rng/2), entry + CAP_PIPS)
-        if (entry - tp) >= TP_MIN_PIPS:
-            return ("SELL", entry, tp, sl, "PULLBACK-DOWN")
-
-    return None
-
-# ----------------------- ОТПРАВКИ -----------------------
-async def send_signal(side: str, entry: float, tp: float, sl: float, reason: str):
-    global active_trade
-    if SINGLE_TRADE_MODE and active_trade is not None:
-        return
-    active_trade = Trade(side=side, entry=entry, tp=tp, sl=sl, created_at=time())
-
-    tp_p = pips(tp, entry)
-    sl_p = pips(sl, entry)
-    emoji = "🟢 BUY" if side == "BUY" else "🔴 SELL"
+async def send_signal_msg(sig: dict):
     text = (
-        f"🔥 {emoji} GOLD (XAU) | M1 ({reason})\n"
-        f"Entry: <b>{entry:.2f}</b>\n"
-        f"✅ TP: <b>{tp:.2f}</b> (+{tp_p:.2f} pips)\n"
-        f"🟥 SL: <b>{sl:.2f}</b> (−{sl_p:.2f} pips)\n"
+        f"🔥 {sig['side']} GOLD (XAU) | M1 ({sig['style']})\n"
+        f"Entry: **{fmt_price(sig['entry'])}**\n"
+        f"✅ TP: **{fmt_price(sig['tp'])}**  _(≈{sig['tp_pips']:.2f} pips)_\n"
+        f"🟥 SL: **{fmt_price(sig['sl'])}**  _(≈{sig['sl_pips']:.2f} pips)_\n"
+        f"rng={sig['rng_pips']:.2f} body={sig['body_pips']:.2f}  RR≈{sig['tp_pips']/sig['sl_pips']:.2f}"
     )
-    await bot.send_message(TARGET_CHAT_ID, text)
+    await bot.send_message(TARGET_CHAT_ID, text, parse_mode="Markdown")
 
-async def close_deal(kind: str, level: float):
-    global active_trade
-    if not active_trade:
-        return
-    t = active_trade
-    pnl = pips(level, t.entry)
-    await bot.send_message(
-        TARGET_CHAT_ID,
-        f"✅ DEAL CLOSED: <b>{kind}</b> at <b>{level:.2f}</b> "
-        f"(+{pnl:.2f} pips)\nSide: {t.side}, Entry: {t.entry:.2f}"
+async def send_result_msg(result: str, sig: dict, price: float):
+    emoji = "✅" if result == "TP" else "🟥"
+    text = (
+        f"{emoji} {result} hit | {sig['side']} GOLD (XAU) | M1\n"
+        f"Fill: **{fmt_price(price)}**  vs target **{fmt_price(sig[result.lower()])}**\n"
+        f"TP={sig['tp_pips']:.2f}p, SL={sig['sl_pips']:.2f}p  (RR≈{sig['tp_pips']/sig['sl_pips']:.2f})"
     )
-    active_trade = None
+    await bot.send_message(TARGET_CHAT_ID, text, parse_mode="Markdown")
 
-async def check_active_trade_hit(cur_price: float):
-    if not active_trade:
-        return
-    t = active_trade
-    if t.side == "BUY":
-        if cur_price >= t.tp:
-            await close_deal("TP", t.tp)
-        elif cur_price <= t.sl:
-            await close_deal("SL", t.sl)
-    else:  # SELL
-        if cur_price <= t.tp:
-            await close_deal("TP", t.tp)
-        elif cur_price >= t.sl:
-            await close_deal("SL", t.sl)
+def price_crossed(value: float, target: float, side: str, kind: str) -> bool:
+    """
+    Проверка достижения TP/SL баром (по Close/High/Low):
+    kind = 'tp'/'sl'
+    """
+    if kind == "tp":
+        if side == "BUY":
+            return value >= target
+        else:
+            return value <= target
+    else:  # sl
+        if side == "BUY":
+            return value <= target
+        else:
+            return value >= target
 
-# ----------------------- ОСНОВНОЙ ЦИКЛ -----------------------
+# ---------- Основной цикл движка ----------
+
 async def engine_loop():
-    global last_close_ts
-    logger.info("Engine loop started")
+    logging.info("Engine loop started")
     while True:
         try:
-            df = await load_history()
-            # берём последнюю закрытую свечу
-            last_bar = df.iloc[-1]
-            # индекс — это pandas.Timestamp
-            ts = float(pd.Timestamp(last_bar.name).timestamp())
+            ES.reset_day_counters_if_new_day()
 
-            close_price = float(last_bar["close"])
+            # Активная сделка? — следим за достижением TP/SL и только потом ищем новую
+            if ES.active_trade and ES.active_trade.get("active", False):
+                df = load_m1_history(SYMBOL, 4)
+                _, o, h, l, c = last_closed_candle(df)
+                ES.last_price = c
 
-            # сначала проверяем открытую сделку
-            await check_active_trade_hit(close_price)
+                if price_crossed(h, ES.active_trade["tp"], ES.active_trade["side"], "tp") or \
+                   price_crossed(c, ES.active_trade["tp"], ES.active_trade["side"], "tp"):
+                    ES.active_trade["active"] = False
+                    await send_result_msg("TP", ES.active_trade, c)
+                    ES.active_trade = None
+                    # Бар-кулдаун опционально
+                    ES.cooldown_left = ES.cooldown_bars
 
-            # чтобы не генерить несколько раз по одной и той же свече
-            if ts > last_close_ts and (active_trade is None):
-                sig = detect_signal(df)
+                elif price_crossed(l, ES.active_trade["sl"], ES.active_trade["side"], "sl") or \
+                     price_crossed(c, ES.active_trade["sl"], ES.active_trade["side"], "sl"):
+                    ES.active_trade["active"] = False
+                    await send_result_msg("SL", ES.active_trade, c)
+                    ES.active_trade = None
+                    ES.cooldown_left = ES.cooldown_bars
+
+                await asyncio.sleep(POLL_SEC)
+                continue
+
+            # Нет активной — ищем новую, но только по НОВОЙ закрытой свече
+            df = load_m1_history(SYMBOL, HISTORY_BARS)
+            bar_ts, o, h, l, c = last_closed_candle(df)
+            ES.last_price = c
+
+            if ES.cooldown_left > 0:
+                # ждём N баров
+                if ES.last_bar_ts is None or bar_ts > ES.last_bar_ts:
+                    ES.cooldown_left -= 1
+                    ES.last_bar_ts = bar_ts
+                await asyncio.sleep(POLL_SEC)
+                continue
+
+            if ES.last_bar_ts is None or bar_ts > ES.last_bar_ts:
+                ES.last_bar_ts = bar_ts
+
+                if ES.signals_today >= ES.limit_per_day:
+                    await asyncio.sleep(POLL_SEC)
+                    continue
+
+                sig = build_signal_from_candle(o, h, l, c)
                 if sig:
-                    side, entry, tp, sl, reason = sig
-                    if pips(tp, entry) >= TP_MIN_PIPS:
-                        await send_signal(side, entry, tp, sl, reason)
-                last_close_ts = ts
+                    sig["opened_ts"] = datetime.now(timezone.utc)
+                    sig["bar_ts"] = bar_ts
+                    ES.active_trade = sig
+                    ES.signals_today += 1
+                    await send_signal_msg(sig)
+
+            await asyncio.sleep(POLL_SEC)
 
         except Exception as e:
-            logger.exception("Engine error: %s", e)
+            logging.exception(f"Engine error: {e}")
+            # маленькая пауза, чтобы не крутить ошибки безостановочно
+            await asyncio.sleep(1.0)
 
-        await asyncio.sleep(POLL_SEC)
+# ---------- Команды TG ----------
 
-# ----------------------- КОМАНДЫ -----------------------
-@dp.message_handler(commands=["start"])
+@dp.message_handler(commands=["start"], allowed=True)
 async def cmd_start(m: types.Message):
-    await m.reply("Онлайн. Режим: GOLD (XAU) M1. Команды: /status, /gold")
+    await m.answer(
+        "Я здесь. Отправляю один сигнал за раз по GOLD (M1) и жду исход (TP/SL).\n"
+        "Команды: /status, «Золото», «Команды».",
+    )
 
-@dp.message_handler(commands=["status", "статус"])
+@dp.message_handler(commands=["status"], allowed=True)
 async def cmd_status(m: types.Message):
-    t = active_trade
-    if t:
-        age = int(time() - t.created_at)
-        msg = (f"mode: XAU M1 | open=YES side={t.side} "
-               f"entry={t.entry:.2f} tp={t.tp:.2f} sl={t.sl:.2f} age={age}s")
-    else:
-        msg = "mode: XAU M1 | open=NO"
-    await m.reply(f"<code>\n{msg}\n</code>")
+    last_age = "-"
+    if ES.last_bar_ts:
+        last_age = f"{int((datetime.now(timezone.utc)-ES.last_bar_ts).total_seconds())}s"
+    act = ES.active_trade["side"] if ES.active_trade else "None"
+    await m.answer(
+        "```\n"
+        f"mode: XAU\n"
+        f"alive: OK | poll~{POLL_SEC:.1f}s\n"
+        f"cooldown_bars={ES.cooldown_bars} last_close_age={last_age}\n"
+        f"signals_today={ES.signals_today} (limit={ES.limit_per_day})\n"
+        f"last_price={fmt_price(ES.last_price) if ES.last_price else 'None'}\n"
+        f"active={act}\n"
+        f"tp_min={TP_MIN_PIPS} cap={TP_CAP_PIPS} min_range={MIN_RANGE_PIPS} min_body={MIN_BODY_PIPS}\n"
+        "```",
+        parse_mode="Markdown",
+    )
 
-@dp.message_handler(commands=["gold", "золото"])
-async def cmd_gold(m: types.Message):
-    await m.reply("✅ Режим уже: GOLD (XAU) M1.")
+@dp.message_handler(lambda m: m.text and m.text.lower().strip() in ("золото", "xau", "gold"), allowed=True)
+async def set_gold(m: types.Message):
+    ES.mode = "XAU"
+    await m.answer("✅ Режим уже: GOLD (XAU) M1.")
 
-# ----------------------- MAIN -----------------------
-async def main():
-    # параллельно запускаем движок и телеграм
-    loop_task = asyncio.create_task(engine_loop())
-    try:
-        await start_polling(dp, skip_updates=True)
-    finally:
-        loop_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await loop_task
+@dp.message_handler(lambda m: m.text and "команд" in m.text.lower(), allowed=True)
+async def cmd_help(m: types.Message):
+    await m.answer(
+        "Команды:\n"
+        "• /start — приветствие\n"
+        "• /status — состояние\n"
+        "• «Золото» — режим XAU M1\n\n"
+        "Бот шлёт новый сигнал только когда завершится предыдущий (TP/SL).",
+    )
+
+@dp.message_handler()
+async def ignore(m: types.Message):
+    # игнор всего остального, чтобы не засорять чат
+    pass
+
+# ---------- Запуск ----------
+
+async def on_startup(_):
+    # отдельная задача с движком
+    asyncio.create_task(engine_loop())
+    logging.info("Bot started, engine scheduled.")
 
 if __name__ == "__main__":
-    import contextlib
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    # ВАЖНО: НИКАКИХ asyncio.run(...) !
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)

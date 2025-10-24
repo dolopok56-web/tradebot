@@ -28,7 +28,7 @@ SYMBOL = "GC=F"     # Yahoo Gold Futures
 TF = "1m"           # 1 минута
 
 # Пипсы / частоты
-PIP = 0.1
+PIP = 1.0
 POLL_SEC = 1.0          # частота опроса (сек)
 HISTORY_BARS = 120
 
@@ -367,3 +367,4 @@ async def on_startup(_):
 if __name__ == "__main__":
     # aiogram v2.x
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+

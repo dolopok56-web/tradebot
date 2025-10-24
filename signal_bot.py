@@ -15,7 +15,7 @@ from aiogram.dispatcher.filters import BoundFilter
 
 # =============== НАСТРОЙКИ ===============
 
-SYMBOL = "GC=F"           # Gold futures в Yahoo
+SYMBOL = "XAUUSD=X"         # Gold futures в Yahoo
 TF = "1m"                 # базовый таймфрейм
 PIP = 1.0                 # 1 пипс = 1.0 пункта (как у твоего брокера)
 POLL_SEC = 0.6            # опрос фида (сек)
@@ -318,3 +318,4 @@ async def on_startup(_):
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+

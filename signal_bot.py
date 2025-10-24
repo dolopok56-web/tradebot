@@ -23,7 +23,7 @@ from aiogram.filters import Command
 
 # ========= CONFIG =========
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "6784470762")
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "6784470762"))
 
 SYMBOL_NAME = "GOLD (GC=F/XAU)"
 POLL_SEC = 1.0
@@ -236,4 +236,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+
 

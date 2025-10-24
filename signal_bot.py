@@ -1,61 +1,60 @@
 # signal_bot.py
 # -*- coding: utf-8 -*-
 
+import os
 import asyncio
 import logging
-import time
 from datetime import datetime, timezone
-import json
-import socket
 
 import pandas as pd
 import yfinance as yf
-from requests import RequestException
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.dispatcher.filters import BoundFilter
 
-# ==================== ЖЁСТКИЕ НАСТРОЙКИ ====================
+# =============== НАСТРОЙКИ ===============
 
-# Твои данные — ВШИТЫ. Если когда-нибудь сменишь — поменяй тут.
-MAIN_BOT_TOKEN = "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs"
-OWNER_ID = 6784470762
-TARGET_CHAT_ID = 6784470762
+SYMBOL = "GC=F"           # Gold futures в Yahoo
+TF = "1m"                 # базовый таймфрейм
+PIP = 1.0                 # 1 пипс = 1.0 пункта (как у твоего брокера)
+POLL_SEC = 0.6            # опрос фида (сек)
+HISTORY_BARS = 300        # сколько М1 берём для работы
 
-# Инструмент и таймфрейм
-SYMBOL = "GC=F"     # Yahoo Gold Futures
-TF = "1m"           # 1 минута
+# фильтры свечей, чтобы не брать «пыль»
+MIN_RANGE_PIPS = 6.0      # минимум (High-Low) в пипсах
+MIN_BODY_PIPS = 2.0       # минимум тело свечи в пипсах
+TP_MIN_PIPS = 8.0         # мин. TP
+TP_CAP_PIPS = 50.0        # макс. TP (ограничитель)
+RR = 1.5                  # целевой RR
 
-# Пипсы / частоты
-PIP = 1.0
-POLL_SEC = 1.0          # частота опроса (сек)
-HISTORY_BARS = 120
+# тренд М5: сколько М5-баров берём для наклона
+M5_TREND_BARS = 6         # ~30 минут тренда
+M5_MIN_SLOPE_PIPS = 2.0   # минимальный наклон тренда в пипсах, чтобы считать направленным
 
-# Фильтры свечи
-MIN_RANGE_PIPS = 0.3
-MIN_BODY_PIPS = 0.1
+# Лимиты
+DAILY_LIMIT = 30          # сигналы/день максимум
 
-# TP/SL и RR
-TP_MIN_PIPS = 0.4
-TP_CAP_PIPS = 3.0
-RR_DEFAULT = 1.5
+# Токены (можно задать через переменные среды или вписать сюда)
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
+OWNER_ID = int(os.getenv("OWNER_ID", "6784470762") or 0)
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or 0)
 
-# Анти-спам
-SIGNALS_PER_DAY_LIMIT = 50
-COOLDOWN_BARS = 0      # 0=без кулдауна после сделки, можно менять
-
-# ===========================================================
+# =========================================
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 
+if not MAIN_BOT_TOKEN or not TARGET_CHAT_ID or not OWNER_ID:
+    logging.error("Задай MAIN_BOT_TOKEN / OWNER_ID / TARGET_CHAT_ID (env или в коде).")
+    raise SystemExit(1)
+
 bot = Bot(token=MAIN_BOT_TOKEN)
 dp = Dispatcher(bot)
 
-
+# --- доступ только владельцу/цели
 class AllowedChat(BoundFilter):
     key = "allowed"
 
@@ -69,99 +68,51 @@ class AllowedChat(BoundFilter):
             return True
         return False
 
-
 dp.filters_factory.bind(AllowedChat)
 
-
+# --- состояние
 class EngineState:
     def __init__(self):
-        self.last_bar_ts = None       # datetime UTC последней закрытой свечи
+        self.last_bar_ts = None              # время последней закрытой М1
         self.last_price = None
         self.signals_today = 0
-        self.limit_per_day = SIGNALS_PER_DAY_LIMIT
-        self.cooldown_bars = COOLDOWN_BARS
-        self.cooldown_left = 0
-        self.active_trade = None      # dict | None
-
-    def reset_day_if_needed(self, new_bar_ts):
-        if self.last_bar_ts and new_bar_ts.date() != self.last_bar_ts.date():
-            self.signals_today = 0
-            self.cooldown_left = 0
-
+        self.active_trade = None             # dict | None
+        self.started_utc_date = datetime.now(timezone.utc).date()
 
 ES = EngineState()
 
-# -------------------- Утилиты --------------------
+# ========= утилиты =========
 
-def pips(value: float) -> float:
-    return abs(value) / PIP
+def pips_from_move(dpts: float) -> float:
+    return abs(dpts) / PIP
 
-
-def pips_to_price(pips_count: float) -> float:
-    return pips_count * PIP
-
+def price_from_pips(pips_val: float) -> float:
+    return pips_val * PIP
 
 def fmt_price(x: float) -> str:
     return f"{x:,.2f}".replace(",", " ")
 
-
 def load_m1_history(symbol: str, bars: int) -> pd.DataFrame:
     """
-    Надёжный загрузчик 1m истории с retry и fallback.
+    История М1. Последняя строка у Yahoo часто незакрытая — поэтому берём предпоследнюю,
+    если таймстамп совпадает с текущей минутой.
     """
-    tries = 0
-    max_tries = 5
-    delay = 1.0
-    while tries < max_tries:
-        tries += 1
-        try:
-            df = yf.download(
-                tickers=symbol,
-                period="2d",
-                interval="1m",
-                progress=False,
-                threads=False,
-            )
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df = df.tail(bars + 3).copy()
-                try:
-                    df.index = df.index.tz_convert("UTC")
-                except Exception:
-                    df.index = df.index.tz_localize("UTC")
-                return df
+    df = yf.download(
+        tickers=symbol,
+        period="2d",
+        interval="1m",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("Empty history")
 
-            logging.warning("yfinance empty DF, fallback to Ticker.history (try %d/%d)", tries, max_tries)
-            t = yf.Ticker(symbol)
-            df2 = t.history(period="2d", interval="1m", auto_adjust=False)
-            if isinstance(df2, pd.DataFrame) and not df2.empty:
-                df2 = df2.tail(bars + 3).copy()
-                try:
-                    df2.index = df2.index.tz_convert("UTC")
-                except Exception:
-                    df2.index = df2.index.tz_localize("UTC")
-                return df2
+    df = df.tail(bars + 5).copy()
+    df.index = df.index.tz_convert("UTC")
+    return df
 
-            logging.warning("Fallback empty (try %d/%d). Sleep %.1fs", tries, max_tries, delay)
-            time.sleep(delay)
-            delay *= 1.8
-
-        except (json.JSONDecodeError, RequestException, socket.timeout) as e:
-            logging.warning("Network/JSON error: %s (try %d/%d). Sleep %.1fs", e, tries, max_tries, delay)
-            time.sleep(delay)
-            delay *= 1.8
-        except Exception as e:
-            logging.exception("load_m1_history unexpected (try %d/%d): %s", tries, max_tries, e)
-            time.sleep(delay)
-            delay *= 1.8
-
-    raise RuntimeError("Empty history")
-
-
-def last_closed_candle(df: pd.DataFrame):
-    """
-    Вернуть последнюю ЗАКРЫТУЮ свечу (ts, o, h, l, c).
-    Если последняя строка совпадает с текущей минутой — берём предыдущую.
-    """
+def pick_last_closed(df: pd.DataFrame):
     now_min = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     ts = df.index[-1].to_pydatetime()
     if ts >= now_min:
@@ -171,153 +122,166 @@ def last_closed_candle(df: pd.DataFrame):
         row = df.iloc[-1]
     return ts, float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
 
+def m5_trend_from_m1(df_m1: pd.DataFrame):
+    """
+    Делаем М5 из М1 и оцениваем наклон за последние M5_TREND_BARS:
+    > 0 — восходящий тренд, < 0 — нисходящий, около 0 — флэт.
+    Возвращаем: 'UP' | 'DOWN' | 'FLAT'
+    """
+    df = df_m1.resample("5T").agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna()
+    if len(df) < M5_TREND_BARS + 1:
+        return "FLAT"
 
-def build_signal(o, h, l, c):
-    rng_p = pips(h - l)
-    body_p = pips(c - o)
-    if rng_p < MIN_RANGE_PIPS or abs(body_p) < MIN_BODY_PIPS:
-        return None
+    tail = df.tail(M5_TREND_BARS)
+    start = float(tail["Close"].iloc[0])
+    end = float(tail["Close"].iloc[-1])
+    move_pips = pips_from_move(end - start)
 
-    side = "SELL" if c < o else "BUY"
-    style = "PULLBACK-DOWN" if side == "SELL" else "PULLBACK-UP"
-    entry = c
+    if move_pips < M5_MIN_SLOPE_PIPS:
+        return "FLAT"
+    return "UP" if end > start else "DOWN"
 
-    base_tp = max(TP_MIN_PIPS, 0.9 * rng_p)
-    tp_p = min(base_tp, TP_CAP_PIPS)
-    sl_p = max(tp_p / RR_DEFAULT, tp_p * 0.6)
+def build_signal(side: str, entry: float, rng_pips: float, body_pips: float):
+    # TP как max(MIN, 0.7*rng) и не больше CAP
+    base_tp = max(TP_MIN_PIPS, 0.7 * rng_pips)
+    tp_pips = min(base_tp, TP_CAP_PIPS)
+
+    sl_pips = max(tp_pips / RR, tp_pips * 0.6)
 
     if side == "SELL":
-        tp = entry - pips_to_price(tp_p)
-        sl = entry + pips_to_price(sl_p)
+        tp = entry - price_from_pips(tp_pips)
+        sl = entry + price_from_pips(sl_pips)
     else:
-        tp = entry + pips_to_price(tp_p)
-        sl = entry - pips_to_price(sl_p)
+        tp = entry + price_from_pips(tp_pips)
+        sl = entry - price_from_pips(sl_pips)
 
     return {
         "side": side,
-        "style": style,
         "entry": entry,
         "tp": tp,
         "sl": sl,
-        "tp_pips": tp_p,
-        "sl_pips": sl_p,
-        "rng_pips": rng_p,
-        "body_pips": abs(body_p),
+        "tp_pips": tp_pips,
+        "sl_pips": sl_pips,
+        "rng_pips": rng_pips,
+        "body_pips": body_pips,
         "bar_ts": None,
-        "opened_ts": None,
         "active": True,
     }
 
+def crossed(value: float, target: float, side: str, kind: str) -> bool:
+    # kind: 'tp' / 'sl'
+    if kind == "tp":
+        return value >= target if side == "BUY" else value <= target
+    else:
+        return value <= target if side == "BUY" else value >= target
 
 async def send_signal(sig: dict):
     txt = (
-        f"🔥 {sig['side']} GOLD (XAU) | M1 ({sig['style']})\n"
+        f"🔥 {sig['side']} GOLD (XAU) | M1\n"
         f"Entry: **{fmt_price(sig['entry'])}**\n"
-        f"✅ TP: **{fmt_price(sig['tp'])}**  _(≈{sig['tp_pips']:.2f} pips)_\n"
-        f"🟥 SL: **{fmt_price(sig['sl'])}**  _(≈{sig['sl_pips']:.2f} pips)_\n"
+        f"✅ TP: **{fmt_price(sig['tp'])}**  (~{sig['tp_pips']:.2f} pips)\n"
+        f"🟥 SL: **{fmt_price(sig['sl'])}**  (~{sig['sl_pips']:.2f} pips)\n"
         f"rng={sig['rng_pips']:.2f} body={sig['body_pips']:.2f}  RR≈{sig['tp_pips']/sig['sl_pips']:.2f}"
     )
     await bot.send_message(TARGET_CHAT_ID, txt, parse_mode="Markdown")
 
-
-async def send_result(result: str, sig: dict, price: float):
-    emoji = "✅" if result == "TP" else "🟥"
+async def send_result(kind: str, sig: dict, fill: float):
+    emoji = "✅" if kind == "TP" else "🟥"
+    key = "tp" if kind == "TP" else "sl"
     txt = (
-        f"{emoji} {result} hit | {sig['side']} GOLD (XAU) | M1\n"
-        f"Fill: **{fmt_price(price)}**  vs target **{fmt_price(sig[result.lower()])}**\n"
+        f"{emoji} {kind} hit | {sig['side']} GOLD (XAU) | M1\n"
+        f"Fill: **{fmt_price(fill)}**  vs target **{fmt_price(sig[key])}**\n"
         f"TP={sig['tp_pips']:.2f}p, SL={sig['sl_pips']:.2f}p  (RR≈{sig['tp_pips']/sig['sl_pips']:.2f})"
     )
     await bot.send_message(TARGET_CHAT_ID, txt, parse_mode="Markdown")
 
+# ========= основной цикл =========
 
-def crossed(val: float, target: float, side: str, kind: str) -> bool:
-    if kind == "tp":
-        return val >= target if side == "BUY" else val <= target
-    else:
-        return val <= target if side == "BUY" else val >= target
-
-
-# -------------------- ДВИЖОК --------------------
-
-async def engine_loop():
-    logging.info("Engine loop started")
+async def engine():
+    logging.info("Engine started.")
     while True:
         try:
-            # если есть активная — следим только за ней
-            if ES.active_trade and ES.active_trade.get("active", False):
-                df = load_m1_history(SYMBOL, 4)
-                _, o, h, l, c = last_closed_candle(df)
+            # сброс дневного лимита по UTC-датe
+            today = datetime.now(timezone.utc).date()
+            if today != ES.started_utc_date:
+                ES.started_utc_date = today
+                ES.signals_today = 0
+
+            # если есть активная сделка — отслеживаем TP/SL
+            if ES.active_trade and ES.active_trade.get("active"):
+                df = load_m1_history(SYMBOL, 5)
+                _, o, h, l, c = pick_last_closed(df)
                 ES.last_price = c
 
-                if crossed(h, ES.active_trade["tp"], ES.active_trade["side"], "tp") or \
-                   crossed(c, ES.active_trade["tp"], ES.active_trade["side"], "tp"):
+                if crossed(h, ES.active_trade["tp"], ES.active_trade["side"], "tp") or crossed(c, ES.active_trade["tp"], ES.active_trade["side"], "tp"):
                     ES.active_trade["active"] = False
                     await send_result("TP", ES.active_trade, c)
                     ES.active_trade = None
-                    ES.cooldown_left = ES.cooldown_bars
-                    await asyncio.sleep(POLL_SEC)
-                    continue
 
-                if crossed(l, ES.active_trade["sl"], ES.active_trade["side"], "sl") or \
-                   crossed(c, ES.active_trade["sl"], ES.active_trade["side"], "sl"):
+                elif crossed(l, ES.active_trade["sl"], ES.active_trade["side"], "sl") or crossed(c, ES.active_trade["sl"], ES.active_trade["side"], "sl"):
                     ES.active_trade["active"] = False
                     await send_result("SL", ES.active_trade, c)
                     ES.active_trade = None
-                    ES.cooldown_left = ES.cooldown_bars
-                    await asyncio.sleep(POLL_SEC)
-                    continue
 
                 await asyncio.sleep(POLL_SEC)
                 continue
 
-            # Ищем новую — только на НОВОЙ закрытой свече
+            # нет активной — ищем новый сигнал только на НОВОЙ закрытой М1
             df = load_m1_history(SYMBOL, HISTORY_BARS)
-            bar_ts, o, h, l, c = last_closed_candle(df)
+            bar_ts, o, h, l, c = pick_last_closed(df)
             ES.last_price = c
-            ES.reset_day_if_needed(bar_ts)
 
-            if ES.cooldown_left > 0:
-                # отсчитываем кулдаун по закрытым свечам
-                if ES.last_bar_ts is None or bar_ts > ES.last_bar_ts:
-                    ES.cooldown_left -= 1
-                    ES.last_bar_ts = bar_ts
+            # антиспам: только по новой свече
+            if ES.last_bar_ts is not None and bar_ts <= ES.last_bar_ts:
+                await asyncio.sleep(POLL_SEC)
+                continue
+            ES.last_bar_ts = bar_ts
+
+            if ES.signals_today >= DAILY_LIMIT:
                 await asyncio.sleep(POLL_SEC)
                 continue
 
-            if ES.last_bar_ts is None or bar_ts > ES.last_bar_ts:
-                ES.last_bar_ts = bar_ts
+            # фильтр по М5-тренду
+            trend = m5_trend_from_m1(df)
+            rng_p = pips_from_move(h - l)
+            body_p = pips_from_move(c - o)
 
-                if ES.signals_today >= ES.limit_per_day:
-                    await asyncio.sleep(POLL_SEC)
-                    continue
+            # базовые фильтры свечи
+            if rng_p < MIN_RANGE_PIPS or body_p < MIN_BODY_PIPS or trend == "FLAT":
+                await asyncio.sleep(POLL_SEC)
+                continue
 
-                sig = build_signal(o, h, l, c)
-                if sig:
-                    sig["bar_ts"] = bar_ts
-                    sig["opened_ts"] = datetime.now(timezone.utc)
-                    ES.active_trade = sig
-                    ES.signals_today += 1
-                    await send_signal(sig)
+            # выбираем сторону в сторону тренда
+            side = None
+            if trend == "UP" and c > o:
+                side = "BUY"
+            elif trend == "DOWN" and c < o:
+                side = "SELL"
+
+            if not side:
+                await asyncio.sleep(POLL_SEC)
+                continue
+
+            sig = build_signal(side, c, rng_p, body_p)
+            sig["bar_ts"] = bar_ts
+            ES.active_trade = sig
+            ES.signals_today += 1
+            await send_signal(sig)
 
             await asyncio.sleep(POLL_SEC)
 
         except Exception as e:
-            logging.exception("Engine error: %s", e)
-            await asyncio.sleep(5.0)  # пауза при проблемах, чтобы не спамить
+            logging.exception(f"Engine error: {e}")
+            await asyncio.sleep(1.0)
 
-
-# -------------------- КОМАНДЫ TG --------------------
+# ========= команды TG =========
 
 @dp.message_handler(commands=["start"], allowed=True)
-async def cmd_start(m: types.Message):
-    await m.answer(
-        "Готов. Даю ОДИН сигнал по GOLD (M1) и жду исход (TP/SL). "
-        "Команды: /status, «Золото», «Команды».",
-    )
-
+async def _start(m: types.Message):
+    await m.answer("Готов. Даю **один** сигнал за раз по XAU (М1) в сторону тренда М5. Команды: /status, «Золото», «Команды».")
 
 @dp.message_handler(commands=["status"], allowed=True)
-async def cmd_status(m: types.Message):
+async def _status(m: types.Message):
     last_age = "-"
     if ES.last_bar_ts:
         last_age = f"{int((datetime.now(timezone.utc)-ES.last_bar_ts).total_seconds())}s"
@@ -326,46 +290,31 @@ async def cmd_status(m: types.Message):
         "```\n"
         f"mode: XAU\n"
         f"alive: OK | poll~{POLL_SEC:.1f}s\n"
-        f"cooldown_bars={ES.cooldown_bars} last_close_age={last_age}\n"
-        f"signals_today={ES.signals_today} (limit={ES.limit_per_day})\n"
-        f"last_price={fmt_price(ES.last_price) if ES.last_price else 'None'}\n"
-        f"active={act}\n"
-        f"tp_min={TP_MIN_PIPS} cap={TP_CAP_PIPS} min_range={MIN_RANGE_PIPS} min_body={MIN_BODY_PIPS}\n"
+        f"last_close_age={last_age}  signals_today={ES.signals_today}/{DAILY_LIMIT}\n"
+        f"last_price={fmt_price(ES.last_price) if ES.last_price else 'None'}  active={act}\n"
+        f"filters: rng>={MIN_RANGE_PIPS}p body>={MIN_BODY_PIPS}p  RR={RR}\n"
+        f"tp_min={TP_MIN_PIPS}p cap={TP_CAP_PIPS}p  PIP={PIP}\n"
         "```",
         parse_mode="Markdown",
     )
 
-
-@dp.message_handler(lambda m: m.text and m.text.lower().strip() in ("золото", "xau", "gold"), allowed=True)
-async def set_gold(m: types.Message):
-    await m.answer("✅ Режим: GOLD (XAU) M1.")
-
+@dp.message_handler(lambda m: m.text and m.text.lower().strip() in ("золото","xau","gold"), allowed=True)
+async def _gold(m: types.Message):
+    await m.answer("✅ Режим: GOLD (XAU) M1. Фильтр тренда М5 активен.")
 
 @dp.message_handler(lambda m: m.text and "команд" in m.text.lower(), allowed=True)
-async def cmd_help(m: types.Message):
-    await m.answer(
-        "Команды:\n"
-        "• /start — приветствие\n"
-        "• /status — состояние\n"
-        "• «Золото» — режим XAU M1\n\n"
-        "Новый сигнал появляется только ПОСЛЕ TP/SL предыдущего."
-    )
-
+async def _help(m: types.Message):
+    await m.answer("Команды: /start, /status, «Золото». Бот шлёт новый сигнал только после TP/SL предыдущего.")
 
 @dp.message_handler()
-async def ignore(m: types.Message):
+async def _ignore(m: types.Message):
     pass
 
-
-# -------------------- ЗАПУСК --------------------
+# ========= запуск =========
 
 async def on_startup(_):
-    asyncio.create_task(engine_loop())
-    logging.info("Bot started, engine scheduled.")
-
+    asyncio.create_task(engine())
+    logging.info("Bot started.")
 
 if __name__ == "__main__":
-    # aiogram v2.x
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-
-

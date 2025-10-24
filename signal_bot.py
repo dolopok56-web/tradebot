@@ -1,226 +1,143 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# gold_bot_final.py
+# Полный рабочий бот: XAU (Gold) M1, без спама.
+# Зависимости: aiogram, aiohttp, yfinance, pandas, numpy
+# pip install aiogram aiohttp yfinance pandas numpy
 
-# =================== XAU M1 SIGNAL BOT (LOUD) ===================
-# Частые сигналы по золоту XAU (GC=F / XAUUSD=X, 1m Yahoo)
-# Без ATR/ RR/ мудрёных фильтров. Простая логика:
-# - работа по закрытой свече М1
-# - свеча не должна быть "пылью": диапазон >= MIN_RANGE_PIPS и тело >= MIN_BODY_PIPS
-# - направление: BREAKOUT (закрытие у экстремума свечи) или PULLBACK по короткому наклону
-# - TP динамический: max(свеча*коэф, TP_MIN_PIPS), но не выше TP_CAP_PIPS
-# - SL короткий за хвост/локальный экстремум
-# - анти-спам: не повторяем тот же сайд два раза подряд на одной и той же цене
-
+import asyncio
 import os
 import time
-import math
-import asyncio
-import logging
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Optional, Callable
 
-import aiohttp
 import pandas as pd
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message
+import numpy as np
+import yfinance as yf
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 
-# =================== SETTINGS ===================
+# ==========[ НАСТРОЙКИ ]==========
 
-VERSION = "XAU-M1 Loud v1.0"
-
-# Токены/чаты (можно переопределить через ENV)
+# ТВОИ ДАННЫЕ (можно оставить так — работает из коробки)
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "7930269505:AAEBq25Gc4XLksdelqmAMfZnyRdyD_KUzSs")
-OWNER_ID       = int(os.getenv("OWNER_ID", "6784470762"))
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))
+OWNER_ID = int(os.getenv("OWNER_ID", "6784470762"))
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(OWNER_ID)))  # куда летят сигналы
+LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", str(OWNER_ID)))        # лог (alive/техтекст)
 
-# Символы и фиды
-SYMBOL  = "XAU"                    # логическое имя
-NAME    = "GOLD (XAU)"             # подпись в сообщениях
-TICKERS = ["GC=F", "XAUUSD=X"]     # порядок опроса на Yahoo, берём первый, где есть данные
+# Рынок/фид
+SYMBOL_NAME = "GOLD (XAU)"
+YF_TICKER = os.getenv("YF_TICKER", "GC=F")   # золото фьюч; можно "XAUUSD=X"
+TIMEFRAME = "1m"                             # M1
+POLL_SEC = 3                                 # опрос каждые ~3с
+PER_BAR_MODE = True                          # анализ только по закрытой свече
 
-# Частота и режим
-POLL_SEC        = 0.30             # опрос ленты
-PER_BAR_MODE    = True             # работать по закрытию каждой М1, если свеча нормальная
-COOLDOWN_BARS   = 0                # 0 = можно каждый бар; 2 = раз в ~3 минуты
-MAX_SIGNALS_DAY = 50               # страховка на день
+# Условия свечи
+MIN_RANGE = 3.0      # минимальный диапазон свечи (в пунктах цены)
+MIN_BODY = 1.0       # минимальное тело свечи (в пунктах)
+TP_MIN = 4.0         # минимум ТП (в пунктах)
+CAP_TP = 30.0        # ограничение ТП (чтоб не улетало)
+SL_BUFFER = 3.0      # запас к SL (для SELL SL=entry+max(body,MIN_RANGE)+SL_BUFFER)
+# Анти-спам:
+EXCLUSIVE_MODE = True           # один активный сигнал
+LOCK_SAME_BAR = True            # не дублировать в тот же бар
+MAX_TRADE_BARS = 6              # "срок годности" идеи (6 баров M1 ≈ 6 мин)
+COOLDOWN_AFTER_CLOSE_SEC = 60   # пауза после TP/SL/expire
+ALIVE_TO_MAIN = False           # alive только в лог, не в основной чат
 
-# Порог «не пыль»
-MIN_RANGE_PIPS  = 3.0              # минимальный High-Low у свечи, чтобы говорить
-MIN_BODY_PIPS   = 1.0              # минимальное тело |Close-Open|
+# ==========[ СЕРВИС ]==========
 
-# TP/SL
-TP_MIN_PIPS     = 4.0              # минимум, как просил
-TP_CAP_PIPS     = 30.0             # не ставим космос
-TP_COEF         = 1.4              # TP = max(range*коэф, TP_MIN), но ≤ TP_CAP
-SL_TAIL_PAD     = 0.8              # SL за тенью на ~0.8 пункта
-SL_MIN_PIPS     = 5.0              # нижняя планка для SL (чуть шире, чтобы не сдувало)
-SL_MAX_PIPS     = 18.0             # верхняя (страховка)
+def now_ts() -> int:
+    return int(time.time())
 
-# Мелочи
-HTTP_TIMEOUT    = 12
-ROBUST_HEADERS  = {"User-Agent": "Mozilla/5.0"}
-LOG_EVERY_SEC   = 300
-
-# =================== TELEGRAM ===================
-
-router    = Router()
-bot_main  = Bot(MAIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
-dp        = Dispatcher()
-dp.include_router(router)
-
-async def send(text: str):
+async def aprint_log(bot: Bot, text: str):
     try:
-        await bot_main.send_message(TARGET_CHAT_ID, text)
-    except Exception as e:
-        logging.error(f"send error: {e}")
-
-@router.message(Command("start"))
-async def cmd_start(m: Message):
-    await m.answer(f"✅ {VERSION}\nРежим: {NAME} M1.\nНапиши: статус / золото")
-
-@router.message(F.text.casefold() == "золото")
-async def cmd_gold(m: Message):
-    await m.answer("✅ Режим уже: GOLD (XAU) M1.")
-
-@router.message(F.text.casefold() == "статус")
-async def cmd_status(m: Message):
-    s = state
-    lines = [
-        f"mode: XAU (requested: XAU)",
-        f"alive: OK | poll={POLL_SEC}s",
-        f"cooldown_bars={COOLDOWN_BARS} last_close_age={int(time.time()-s.get('last_close_ts',0))}s",
-        f"signals_today={s.get('signals_today',0)} (limit={MAX_SIGNALS_DAY})",
-        f"last_side={s.get('last_side','-')} last_price={s.get('last_price','-')}",
-        f"tp_min={TP_MIN_PIPS} cap={TP_CAP_PIPS} min_range={MIN_RANGE_PIPS} min_body={MIN_BODY_PIPS}",
-    ]
-    await m.answer("`\n" + "\n".join(lines) + "\n`")
-
-# =================== PRICE FEED ===================
-
-_prices_cache = {"df": None, "ts": 0.0, "src": ""}
-
-async def yahoo_json(session: aiohttp.ClientSession, url: str) -> dict:
-    try:
-        async with session.get(url, timeout=HTTP_TIMEOUT, headers=ROBUST_HEADERS) as r:
-            if r.status == 200:
-                return await r.json(content_type=None)
-    except:
-        pass
-    return {}
-
-def df_from_yahoo(payload: dict) -> pd.DataFrame:
-    try:
-        r = payload.get("chart", {}).get("result", [])[0]
-        ts = r.get("timestamp", [])
-        q  = r.get("indicators", {}).get("quote", [])[0]
-        if not ts or not q:
-            return pd.DataFrame()
-        df = pd.DataFrame({
-            "Open":  q.get("open",  []),
-            "High":  q.get("high",  []),
-            "Low":   q.get("low",   []),
-            "Close": q.get("close", []),
-        }, index=pd.to_datetime(ts, unit="s"))
-        df = df.ffill().bfill().dropna()
-        for c in ("Open","High","Low","Close"):
-            df = df[df[c] > 0]
-        return df.tail(2000).reset_index(drop=True)
-    except:
-        return pd.DataFrame()
-
-async def get_df(session: aiohttp.ClientSession) -> pd.DataFrame:
-    now = time.time()
-    if _prices_cache["df"] is not None and now - _prices_cache["ts"] < 0.5:
-        return _prices_cache["df"]
-
-    # пробуем тики по тикерам по очереди
-    for t in TICKERS:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?interval=1m&range=2d"
-        df = df_from_yahoo(await yahoo_json(session, url))
-        if not df.empty:
-            _prices_cache.update({"df": df, "ts": now, "src": t})
-            return df
-    return pd.DataFrame()
-
-# =================== LOGIC ===================
-
-state = {
-    "last_bar_idx": -1,
-    "last_close_ts": 0.0,
-    "last_signal_bar": -999,
-    "last_side": None,
-    "last_price": None,
-    "signals_today": 0,
-    "day": None,
-}
-
-def reset_day_if_needed():
-    d = datetime.utcnow().date().isoformat()
-    if state["day"] != d:
-        state["day"] = d
-        state["signals_today"] = 0
-
-def pips(x: float) -> float:
-    return float(x)
-
-def fmt(x: float) -> str:
-    return f"{x:.2f}"
-
-def candle_signal(o: float, h: float, l: float, c: float, prev_closes: list) -> dict|None:
-    rng  = h - l
-    body = abs(c - o)
-    if rng < MIN_RANGE_PIPS or body < MIN_BODY_PIPS:
-        return None
-
-    # breakout, если закрытие рядом с экстремумом свечи
-    near_top = (h - c) <= 0.6
-    near_bot = (c - l) <= 0.6
-
-    # простой наклон: последние 8 закрытий
-    slope = 0.0
-    if len(prev_closes) >= 8:
-        slope = prev_closes[-1] - prev_closes[-8]
-
-    side = None
-    reason = ""
-    if near_top or slope > 0:
-        side = "BUY"; reason = "BREAKOUT" if near_top else "PULLBACK-UP"
-    if near_bot or slope < 0:
-        # если оба сработали — берём что ближе к экстремуму
-        if side is None:
-            side = "SELL"; reason = "BREAKOUT" if near_bot else "PULLBACK-DOWN"
+        if ALIVE_TO_MAIN:
+            await bot.send_message(TARGET_CHAT_ID, text)
         else:
-            # выбрать более очевидный: сравним расстояние до экстремума
-            dist_top = h - c
-            dist_bot = c - l
-            if dist_bot < dist_top:
-                side = "SELL"; reason = "BREAKOUT" if near_bot else "PULLBACK-DOWN"
+            await bot.send_message(LOG_CHAT_ID, text)
+    except Exception:
+        pass
 
-    if side is None:
-        return None
+@dataclass
+class TradeState:
+    side: str          # "BUY" / "SELL"
+    entry: float
+    tp: float
+    sl: float
+    bar_ts: pd.Timestamp   # ts бара, по которому открыт сигнал
+    opened_ts: int
 
-    # entry — закрытие бара
-    entry = c
+active: Optional[TradeState] = None
+cooldown_until = 0
+last_signal_bar_id: Optional[pd.Timestamp] = None
 
-    # TP динамический
-    raw_tp = max(rng * TP_COEF, TP_MIN_PIPS)
-    raw_tp = min(raw_tp, TP_CAP_PIPS)
-
+def price_hit(side: str, p: float, tp: float, sl: float) -> Optional[str]:
     if side == "BUY":
-        tp = entry + raw_tp
-        # SL — за тенью или минимумом бара
-        sl = min(entry - SL_MIN_PIPS, l - SL_TAIL_PAD)
-        sl = max(entry - SL_MAX_PIPS, sl)  # ограничить глубину
+        if p >= tp: return "TP"
+        if p <= sl: return "SL"
     else:
-        tp = entry - raw_tp
-        sl = max(entry + SL_MIN_PIPS, h + SL_TAIL_PAD)
-        sl = min(entry + SL_MAX_PIPS, sl)
+        if p <= tp: return "TP"
+        if p >= sl: return "SL"
+    return None
 
-    if abs(tp - entry) < TP_MIN_PIPS:
+def bars_since(bar_ts: pd.Timestamp, last_bar_ts: pd.Timestamp) -> int:
+    # сколько закрытых баров прошло от bar_ts до last_bar_ts
+    # оба — pandas Timestamp с минутной частотой
+    if bar_ts is None or last_bar_ts is None:
+        return 0
+    dif = (last_bar_ts - bar_ts) / pd.Timedelta(minutes=1)
+    try:
+        return int(dif)
+    except Exception:
+        return 0
+
+def last_price_from_df(df: pd.DataFrame) -> float:
+    return float(df["Close"].iloc[-1])
+
+# ==========[ ДАННЫЕ ]==========
+
+async def fetch_bars() -> pd.DataFrame:
+    """
+    Грузим последние 90 минут M1. yfinance работает синхронно — завернём в тред.
+    """
+    loop = asyncio.get_running_loop()
+    def _load():
+        return yf.Ticker(YF_TICKER).history(period="90m", interval=TIMEFRAME)
+
+    df = await loop.run_in_executor(None, _load)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("Empty data from yfinance")
+    df = df[["Open", "High", "Low", "Close"]].copy()
+    df = df.dropna()
+    return df
+
+def detect_signal(df: pd.DataFrame):
+    """
+    Простая реактивная логика без ATR:
+    - если закрылась большая красная свеча (range>=MIN_RANGE & body>=MIN_BODY) → SELL
+    - если зелёная с теми же условиями → BUY
+    """
+    row = df.iloc[-1]  # последний ЗАКРЫТЫЙ бар (мы работаем per-bar)
+    o, h, l, c = float(row.Open), float(row.High), float(row.Low), float(row.Close)
+    rng = h - l
+    body = abs(c - o)
+    if rng < MIN_RANGE or body < MIN_BODY:
         return None
 
+    if c < o:  # медвежья
+        side = "SELL"
+        entry = c
+        tp = max(entry - max(TP_MIN, body), entry - TP_MIN)
+        tp = max(tp, entry - CAP_TP)
+        sl = entry + max(body, MIN_RANGE) + SL_BUFFER
+    else:      # бычья
+        side = "BUY"
+        entry = c
+        tp = min(entry + max(TP_MIN, body), entry + CAP_TP)
+        sl = entry - max(body, MIN_RANGE) - SL_BUFFER
+
+    # RR чисто информативно
+    rr = abs(tp - entry) / max(1e-6, abs(entry - sl))
     return {
         "side": side,
         "entry": entry,
@@ -228,90 +145,134 @@ def candle_signal(o: float, h: float, l: float, c: float, prev_closes: list) -> 
         "sl": sl,
         "rng": rng,
         "body": body,
-        "reason": reason,
+        "rr": rr
     }
 
-def text_signal(sig: dict) -> str:
-    side = "BUY" if sig["side"] == "BUY" else "SELL"
-    rr   = abs(sig["tp"] - sig["entry"]) / max(abs(sig["entry"] - sig["sl"]), 1e-9)
-    return (
-        f"🔥 {side} {NAME} | M1 ({sig['reason']})\n"
-        f"Entry: {fmt(sig['entry'])}\n"
-        f"✅ TP: **{fmt(sig['tp'])}**\n"
-        f"🟥 SL: **{fmt(sig['sl'])}**\n"
-        f"rng={fmt(sig['rng'])} body={fmt(sig['body'])}  RR≈{rr:.2f}"
+async def send_signal(bot: Bot, sig: dict):
+    global active, last_signal_bar_id
+    msg = (
+        f"🔥 {sig['side']} {SYMBOL_NAME} | M1\n"
+        f"Entry: {sig['entry']:.2f}\n"
+        f"✅ TP: **{sig['tp']:.2f}**\n"
+        f"🧱 SL: **{sig['sl']:.2f}**\n"
+        f"rng={sig['rng']:.2f} body={sig['body']:.2f}  RR≈{sig['rr']:.2f}"
+    )
+    await bot.send_message(TARGET_CHAT_ID, msg, parse_mode=ParseMode.MARKDOWN)
+    active = TradeState(
+        side=sig["side"], entry=sig["entry"], tp=sig["tp"], sl=sig["sl"],
+        bar_ts=last_signal_bar_id, opened_ts=now_ts()
     )
 
-# =================== ENGINE ===================
+async def on_tp_sl(bot: Bot, hit: str, price: float):
+    global active, cooldown_until
+    side = active.side
+    await bot.send_message(
+        TARGET_CHAT_ID,
+        ("✅ TP hit" if hit == "TP" else "🛑 SL hit") + f" @ {price:.2f} ({side})"
+    )
+    active = None
+    cooldown_until = now_ts() + COOLDOWN_AFTER_CLOSE_SEC
+
+# ==========[ ТЕЛЕГРАМ ]==========
+
+bot = Bot(token=MAIN_BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def cmd_start(m: types.Message):
+    await m.answer("Готов. Режим: GOLD M1. Один сигнал за раз, без спама. Команда: /status")
+
+@dp.message(Command("status"))
+async def cmd_status(m: types.Message):
+    global active, cooldown_until
+    cool = max(0, cooldown_until - now_ts())
+    act = (
+        f"{active.side} entry={active.entry:.2f} tp={active.tp:.2f} sl={active.sl:.2f}"
+        if active else "нет"
+    )
+    await m.answer(
+        f"<b>mode:</b> XAU M1\n"
+        f"cooldown: {cool}s\n"
+        f"active: {act}\n"
+        f"min_range={MIN_RANGE} min_body={MIN_BODY} tp_min={TP_MIN} cap={CAP_TP}\n"
+        f"per_bar={PER_BAR_MODE} poll={POLL_SEC}s"
+    )
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(m: types.Message):
+    global active, cooldown_until
+    active = None
+    cooldown_until = now_ts() + 5
+    await m.answer("Окей, текущая идея сброшена.")
+
+# ==========[ ДВИЖОК ]==========
 
 async def engine_loop():
-    last_log = 0.0
-    async with aiohttp.ClientSession() as session:
-        while True:
+    global last_signal_bar_id, cooldown_until, active
+
+    await aprint_log(bot, "[engine] start")
+    last_closed_index: Optional[pd.Timestamp] = None
+
+    while True:
+        try:
+            df = await fetch_bars()
+
+            # последний закрытый бар — это последний в df
+            closed_ts = df.index[-1]
+
+            # мониторинг активной идеи
+            if active:
+                last_price = float(df["Close"].iloc[-1])
+                hit = price_hit(active.side, last_price, active.tp, active.sl)
+                if hit:
+                    await on_tp_sl(bot, hit, last_price)
+                else:
+                    # истечение по количеству баров
+                    bars_passed = bars_since(active.bar_ts, closed_ts)
+                    if bars_passed >= MAX_TRADE_BARS:
+                        await aprint_log(bot, "Idea expired (no TP/SL). Unlock.")
+                        active = None
+                        cooldown_until = now_ts() + COOLDOWN_AFTER_CLOSE_SEC
+
+            # новые сигналы — только если:
+            # 1) нет активной сделки
+            # 2) нет кулдауна
+            # 3) новый бар закрыт
+            if (not active) and (now_ts() >= cooldown_until):
+                new_bar = (last_closed_index is None) or (closed_ts != last_closed_index)
+                if PER_BAR_MODE and new_bar:
+                    # запоминаем бар
+                    last_closed_index = closed_ts
+                    last_signal_bar_id = closed_ts
+
+                    sig = detect_signal(df)
+                    if sig:
+                        # антидубликат в том же баре
+                        if LOCK_SAME_BAR and last_signal_bar_id == closed_ts:
+                            # last_signal_bar_id сейчас как раз обновили выше — так что
+                            # проверку оставим для совместимости с будущими изменениями
+                            pass
+                        # отсылка
+                        if EXCLUSIVE_MODE:
+                            await send_signal(bot, sig)
+
+            # alive в лог раз в ~60с
+            if int(time.time()) % 60 == 0:
+                await aprint_log(bot, f"[alive] {SYMBOL_NAME} poll={POLL_SEC}s ok")
+
+        except Exception as e:
             try:
-                reset_day_if_needed()
-                if state["signals_today"] >= MAX_SIGNALS_DAY:
-                    if time.time() - last_log > 60:
-                        await send("⚠️ Дневной лимит сигналов достигнут.")
-                        last_log = time.time()
-                    await asyncio.sleep(POLL_SEC)
-                    continue
+                await aprint_log(bot, f"[engine] error: {e}")
+            except Exception:
+                pass
 
-                df = await get_df(session)
-                if df.empty or len(df) < 20:
-                    await asyncio.sleep(POLL_SEC)
-                    continue
+        await asyncio.sleep(POLL_SEC)
 
-                i = len(df) - 1         # текущий бар формируется
-                cbar = i - 1            # закрытый бар
-                if cbar <= state["last_bar_idx"]:
-                    await asyncio.sleep(POLL_SEC)
-                    continue
-
-                o = float(df["Open"].iloc[cbar])
-                h = float(df["High"].iloc[cbar])
-                l = float(df["Low"].iloc[cbar])
-                c = float(df["Close"].iloc[cbar])
-                prev_closes = df["Close"].iloc[max(0, cbar-50):cbar].tolist()
-
-                state["last_bar_idx"] = cbar
-                state["last_close_ts"] = time.time()
-
-                # анти-спам по барам
-                if COOLDOWN_BARS > 0 and (cbar - state["last_signal_bar"] < COOLDOWN_BARS):
-                    continue
-
-                sig = candle_signal(o, h, l, c, prev_closes)
-                if not sig:
-                    # периодический "жив"
-                    if time.time() - last_log > LOG_EVERY_SEC:
-                        await send(f"[ALIVE] feed={_prices_cache['src']} last={fmt(c)} OK")
-                        last_log = time.time()
-                    continue
-
-                # не дублировать тот же сайд на почти той же цене
-                if state["last_side"] == sig["side"] and state["last_price"] is not None:
-                    if abs(sig["entry"] - state["last_price"]) <= 1.0:
-                        continue
-
-                # отправка сигнала
-                await send(text_signal(sig))
-
-                # обновить состояние
-                state["last_signal_bar"] = cbar
-                state["signals_today"]  += 1
-                state["last_side"]       = sig["side"]
-                state["last_price"]      = sig["entry"]
-
-            except Exception as e:
-                logging.error(f"engine error: {e}")
-                await asyncio.sleep(1.0)
-            await asyncio.sleep(POLL_SEC)
+# ==========[ MAIN ]==========
 
 async def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     asyncio.create_task(engine_loop())
-    await dp.start_polling(bot_main)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:

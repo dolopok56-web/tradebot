@@ -33,12 +33,12 @@ POLL_SEC = 1.0          # частота опроса (сек)
 HISTORY_BARS = 120
 
 # Фильтры свечи
-MIN_RANGE_PIPS = 3.0
-MIN_BODY_PIPS = 1.0
+MIN_RANGE_PIPS = 0.3
+MIN_BODY_PIPS = 0.1
 
 # TP/SL и RR
-TP_MIN_PIPS = 4.0
-TP_CAP_PIPS = 30.0
+TP_MIN_PIPS = 0.4
+TP_CAP_PIPS = 3.0
 RR_DEFAULT = 1.5
 
 # Анти-спам
@@ -367,4 +367,5 @@ async def on_startup(_):
 if __name__ == "__main__":
     # aiogram v2.x
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
 
